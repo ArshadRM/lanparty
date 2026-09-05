@@ -272,14 +272,14 @@ stop-iscsi() {
       fi
 
       # If the block backstore exists for this machine, delete it so the underlying device is released
-      if [ -d "/sys/kernel/config/target/core/iblock_0/$MACHINE" ] || [ "$DRY_RUN" = yes ]; then
+      if ls -d /sys/kernel/config/target/core/*/"$MACHINE" > /dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
         doit targetcli "/backstores/block delete $MACHINE"
         NEED_SLEEP=yes
       fi
     done
 
     # If 'updates' backstore exists, delete it too
-    if [ -d "/sys/kernel/config/target/core/iblock_0/updates" ] || [ "$DRY_RUN" = yes ]; then
+    if ls -d /sys/kernel/config/target/core/*/updates > /dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
       doit targetcli "/backstores/block delete updates"
       NEED_SLEEP=yes
     fi
