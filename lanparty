@@ -132,8 +132,16 @@ is-master-mounted-locally() {
 }
 
 is-caching-enabled() {
-  # Check if the page caching layer is currently configured.
-  losetup "$CACHE_LOOP_DEVICE" > /dev/null 2>&1
+  # Check if the page caching layer is currently configured and pointing to the configured base image.
+  local BACKING
+  BACKING=$(losetup -O BACK-FILE -n "$CACHE_LOOP_DEVICE" 2>/dev/null || true)
+  if [ -z "$BACKING" ]; then
+    return 1
+  fi
+  local EXPECTED REAL_BACKING
+  EXPECTED=$(readlink -f "/dev/$VGROUP/$BASE_IMAGE" 2>/dev/null || echo "/dev/$VGROUP/$BASE_IMAGE")
+  REAL_BACKING=$(readlink -f "$BACKING" 2>/dev/null || echo "$BACKING")
+  [ "$REAL_BACKING" = "$EXPECTED" ]
 }
 
 validate-hostnames() {
@@ -325,6 +333,9 @@ create-overlays() {
   # already.
   if ! is-caching-enabled; then
     unmount-master-locally
+    if losetup "$CACHE_LOOP_DEVICE" > /dev/null 2>&1; then
+      doit losetup -d "$CACHE_LOOP_DEVICE"
+    fi
     doit losetup --direct-io=off --read-only $CACHE_LOOP_DEVICE /dev/$VGROUP/$BASE_IMAGE
     mount-master-locally
   elif is-local-mount-point-configured && ! is-master-mounted-locally; then
