@@ -381,6 +381,12 @@ start-iscsi() {
   local SOURCE=$1
   shift
 
+  # If legacy tgtd is running, terminate it so it doesn't hold port 3260
+  if pidof tgtd > /dev/null; then
+    doit killall -9 tgtd
+    doit sleep 1
+  fi
+
   # Ensure LIO kernel modules are loaded
   if [ ! -d /sys/kernel/config/target ]; then
     doit modprobe iscsi_target_mod
@@ -455,9 +461,8 @@ shutdown-hosts() {
     # be executing one command that contains no secrets, there's no security risk from MITM. Also,
     # this should be on a private network anyway.
     #
-    # While we're at it, we take the opportunity to properly quote the arguments in the console
-    # output.
-    COMMAND=( ssh -o "StrictHostKeyChecking no" "$SHUTDOWN_USERNAME@$IP_PREFIX.${HOST_TO_NUMBER[$MACHINE]}" -- 'shutdown /p /f' )
+    local CMD="${SHUTDOWN_COMMAND:-shutdown /p /f}"
+    COMMAND=( ssh -o "StrictHostKeyChecking no" "$SHUTDOWN_USERNAME@$IP_PREFIX.${HOST_TO_NUMBER[$MACHINE]}" -- "$CMD" )
     echo-command "${COMMAND[@]}" "&"
     if [ $DRY_RUN == no ]; then
       "${COMMAND[@]}" &
