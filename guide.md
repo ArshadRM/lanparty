@@ -276,16 +276,14 @@ Also, in order for this to work, you will likely need to enable Wake-on-LAN in t
 
 ### iSCSI server
 
-Let's install the iSCSI server. For some reason iSCSI doesn't like the words "client" and "server" and instead uses "initiator" and "target". And, the server we will use has decided to name itself just `tgt`, not mentioning the iSCSI part at all... ok:
+We use Linux's in-kernel SCSI target framework (LIO) via `targetcli-fb` for high-throughput, multi-threaded iSCSI processing that scales across all CPU cores and takes full advantage of fast SSD / Optane drives:
 
-    apt install tgt
+    apt install targetcli-fb
 
-Note that the `lanparty` script will take care of starting, configuring, and managing `tgt` entirely on its own, dynamically, with no config files. Therefore, I recommend instructing systemd not to run the server at all:
+Note that the `lanparty` script will take care of dynamically creating, configuring, and managing the LIO targets and backstores on demand, with no static config files required. If you are not using LIO for other static targets, you can disable the service at boot:
 
-    systemctl stop tgt
-    systemctl disable tgt
-
-However, this is optional. If you'd like to configure `tgt` to export additional iSCSI volumes independently of the `lanparty` script, there should be no problem with doing so. In this case you probably want systemd to manage starting and stopping it.
+    systemctl stop target
+    systemctl disable target
 
 ### DHCP server
 

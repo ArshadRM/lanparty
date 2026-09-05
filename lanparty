@@ -243,31 +243,49 @@ mount-master-locally() {
 }
 
 stop-iscsi() {
-  # Instruct the iSCSI daemon to delist the given hostnames' volumes. Only hosts passed as
+  # Instruct the iSCSI daemon (LIO) to delist the given hostnames' volumes. Only hosts passed as
   # parameters to this function are affected; the rest are left alone.
   #
   # This is idempotent -- it's not an error if the targets are already unpublished.
 
   bold "================ stop iscsi ================"
 
-  # If tgtd is running, remove the specific targets. (Since we configure tgtd dynamically, we can
-  # assume if it's not running, then any state related to our hosts is already lost.)
-  if pidof tgtd > /dev/null; then
-    NEED_SLEEP=no
+  NEED_SLEEP=no
+
+  if [ -d /sys/kernel/config/target/iscsi ] || [ "$DRY_RUN" = yes ]; then
     for MACHINE in "$@"; do
-      TID=${HOST_TO_TID[$MACHINE]}
-      # Check if the target is currently online.
-      if tgtadm -C 0 --lld iscsi --op show --mode target --tid $TID > /dev/null 2>&1; then
-        # It is, so disable it.
-        doit tgtadm -C 0 --lld iscsi --op delete --force --mode target --tid $TID
+      local TARGET_IQN="$ISCSI_TARGET_PREFIX:$MACHINE"
+
+      # If the target exists in LIO configfs, remove it.
+      if [ -d "/sys/kernel/config/target/iscsi/$TARGET_IQN" ] || [ "$DRY_RUN" = yes ]; then
+        # Terminate any lingering TCP connections on port 3260 for this host to cleanly drop the session
+        if [ "${HOST_TO_NUMBER[$MACHINE]:-none}" != "none" ]; then
+          if [ "$DRY_RUN" = yes ]; then
+            echo-command ss -K dst "$IP_PREFIX.${HOST_TO_NUMBER[$MACHINE]}" dport 3260
+          else
+            ss -K dst "$IP_PREFIX.${HOST_TO_NUMBER[$MACHINE]}" dport 3260 > /dev/null 2>&1 || true
+            ss -K sport 3260 dst "$IP_PREFIX.${HOST_TO_NUMBER[$MACHINE]}" > /dev/null 2>&1 || true
+          fi
+        fi
+        doit targetcli "/iscsi delete $TARGET_IQN"
+        NEED_SLEEP=yes
+      fi
+
+      # If the block backstore exists for this machine, delete it so the underlying device is released
+      if [ -d "/sys/kernel/config/target/core/iblock_0/$MACHINE" ] || [ "$DRY_RUN" = yes ]; then
+        doit targetcli "/backstores/block delete $MACHINE"
         NEED_SLEEP=yes
       fi
     done
 
-    if [ $NEED_SLEEP == yes ]; then
-      # Give tgtd time to close resources. Otherwise, if we try to delete the underlying volumes
-      # too soon, we may get "device or resource busy" errors. It's too bad tgtadm itself doesn't
-      # wait until the resources are fully closed...
+    # If 'updates' backstore exists, delete it too
+    if [ -d "/sys/kernel/config/target/core/iblock_0/updates" ] || [ "$DRY_RUN" = yes ]; then
+      doit targetcli "/backstores/block delete updates"
+      NEED_SLEEP=yes
+    fi
+
+    if [ "$NEED_SLEEP" = yes ]; then
+      # Give the kernel time to close block device handles and clean up state
       doit sleep 1
     fi
   fi
@@ -352,8 +370,7 @@ start-updates() {
 }
 
 start-iscsi() {
-  # Instruct the iSCSI server (tgtd) to publish the volumes for the given hostnames. If tgtd isn't
-  # already running, starts it. If it is running, already-published volumes are not affected.
+  # Instruct the iSCSI server (LIO) to publish the volumes for the given hostnames.
   #
   # The first argument to start-iscsi must be either "updates" if we're publishing the update
   # volume, or "cached" if we're publishing disposable volumes. The remaining arguments are the
@@ -364,58 +381,55 @@ start-iscsi() {
   local SOURCE=$1
   shift
 
-  # Start tgtd if not running.
-  if ! pidof tgtd > /dev/null; then
-    doit tgtd
-
-    # By default tgtd will bind to all addresses. We don't want that, especially if this server
-    # is also being used as a router and therefore has both public and private interfaces. We don't
-    # have any way to authenticate machines, so we need to rely on the network being private.
-    # Tell tgtd to unbind from the wildcards (IPv4 and IPv6) and instead bind only to the
-    # configured server address.
-    doit tgtadm --op update --mode sys --name State -v offline
-    doit tgtadm --lld iscsi --op delete --mode portal --param portal=0.0.0.0:3260
-    doit tgtadm --lld iscsi --op delete --mode portal --param portal=[::]:3260
-    doit tgtadm --lld iscsi --op new --mode portal --param portal=$SERVER_ADDR:3260
-    doit tgtadm --op update --mode sys --name State -v ready
+  # Ensure LIO kernel modules are loaded
+  if [ ! -d /sys/kernel/config/target ]; then
+    doit modprobe iscsi_target_mod
+    doit modprobe target_core_iblock
   fi
 
+  # Prevent targetcli from automatically binding to 0.0.0.0:3260 (WAN safety)
+  # and prevent saving ephemeral COW snapshots to persistent /etc/target/saveconfig.json
+  doit targetcli set global auto_add_default_portal=false
+  doit targetcli set global auto_save_on_exit=false
+
   for MACHINE in "$@"; do
-    # Apparently we must assign a "target ID" number to each machine even though it also has a
-    # name. Why? Probably because the names are IQNs which are so unweildy that no one wants to
-    # use them. Fine, whatever, we have ID numbers for each host, we'll use those.
-    TID=${HOST_TO_TID[$MACHINE]}
-
-    # Create the target.
-    doit tgtadm -C 0 --lld iscsi --op new --mode target --tid $TID -T $ISCSI_TARGET_PREFIX:$MACHINE
-
-    # Decide which device we're publishing.
     case $SOURCE in
       updates )
         DEVICE=/dev/$VGROUP/updates
+        BACKSTORE=updates
         ;;
       cached )
         DEVICE=/dev/mapper/cached-$MACHINE
+        BACKSTORE=$MACHINE
         ;;
       * )
         echo "internal error: start-iscsi bad parameters" >&2
         exit 1;
     esac
 
-    # Add the "logical unit" to the target. Why can a target have multiple LUNs? Why not instead
-    # tell people to have multiple targets? Because iSCSI is over-engineered, that's why. Have you
-    # ever looked at nbd? THAT is how a block device protocol should be. Oh well.
-    doit tgtadm -C 0 --lld iscsi --op new --mode logicalunit --tid $TID --lun 1 -b "$DEVICE"
+    local TARGET_IQN="$ISCSI_TARGET_PREFIX:$MACHINE"
 
-    # Permit the designated machine's IP (and no others) to access this target. Note that this in
-    # itself doesn't provide any security since typically anyone on the internal network can claim
-    # to be this IP address. It does, however, prevent mistakes.
-    doit tgtadm -C 0 --lld iscsi --op bind --mode target --tid $TID -I $IP_PREFIX.${HOST_TO_NUMBER[$MACHINE]}
+    # Create kernel-space direct block backstore (iblock submits bio directly to device-mapper/LVM)
+    doit targetcli "/backstores/block create name=$BACKSTORE dev=$DEVICE"
+
+    # Create iSCSI target
+    doit targetcli "/iscsi create $TARGET_IQN"
+
+    # Bind portal strictly to configured internal server address
+    doit targetcli "/iscsi/$TARGET_IQN/tpg1/portals create $SERVER_ADDR 3260"
+
+    # Map backstore to LUN 1 (matches initiator DHCP configuration :::1:)
+    doit targetcli "/iscsi/$TARGET_IQN/tpg1/luns create /backstores/block/$BACKSTORE 1"
+
+    # Set up open demo mode for dynamic initiator connections with full write access
+    doit targetcli "/iscsi/$TARGET_IQN/tpg1 set attribute authentication=0"
+    doit targetcli "/iscsi/$TARGET_IQN/tpg1 set attribute demo_mode_write_protect=0"
+    doit targetcli "/iscsi/$TARGET_IQN/tpg1 set attribute generate_node_acls=1"
   done
 }
 
 authorize-addr() {
-  doit tgtadm -C 0 --lld iscsi --op bind --mode target --tid ${HOST_TO_TID[$1]} -I $2
+  echo "Notice: LIO operates with dynamic ACLs on private network $SERVER_ADDR; IP $2 is already permitted to connect to $ISCSI_TARGET_PREFIX:$1."
 }
 
 boot-hosts() {
@@ -1090,7 +1104,7 @@ require-configured() {
 }
 
 require-root() {
-  if [ "$(whoami)" != root ]; then
+  if [ "$DRY_RUN" == no -a "$(whoami)" != root ]; then
     echo "ERROR: You need to be root to do this." >&2
     exit 1
   fi
