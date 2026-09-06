@@ -353,6 +353,118 @@ create-overlays() {
   done
 }
 
+diff-sync-devices() {
+  # Perform a block-level diff merge from $1 (source overlay) into $2 (destination base image).
+  # Compares blocks in memory and only writes modified blocks to disk, skipping unchanged blocks.
+  local SRC="$1"
+  local DST="$2"
+  local CHUNK_MB="${3:-2}"
+
+  if [ "$DRY_RUN" = yes ]; then
+    echo-command "diff-sync $SRC -> $DST (chunk size: ${CHUNK_MB}MB)"
+    return 0
+  fi
+
+  if command -v python3 > /dev/null 2>&1; then
+    python3 - "$SRC" "$DST" "$CHUNK_MB" << 'EOF'
+import os, sys, time, struct, fcntl
+
+src_path = sys.argv[1]
+dst_path = sys.argv[2]
+chunk_size = int(sys.argv[3]) * 1024 * 1024
+
+try:
+    src = open(src_path, "rb")
+    dst_read = open(dst_path, "rb")
+    dst_write = open(dst_path, "r+b")
+except Exception as e:
+    sys.stderr.write(f"ERROR: Failed to open devices for diff sync: {e}\n")
+    sys.exit(1)
+
+total_bytes = 0
+try:
+    BLKGETSIZE64 = 0x80081272
+    buf = fcntl.ioctl(src.fileno(), BLKGETSIZE64, b" " * 8)
+    total_bytes = struct.unpack("Q", buf)[0]
+except Exception:
+    pass
+
+if total_bytes == 0:
+    try:
+        src.seek(0, os.SEEK_END)
+        total_bytes = src.tell()
+        src.seek(0, os.SEEK_SET)
+    except Exception:
+        pass
+
+offset = 0
+diff_bytes = 0
+diff_chunks = 0
+total_chunks = (total_bytes + chunk_size - 1) // chunk_size if total_bytes > 0 else 0
+start_time = time.time()
+last_print = start_time
+
+if total_bytes > 0:
+    print(f"Scanning {total_bytes / (1024**3):.2f} GB ({total_chunks} blocks of {chunk_size // (1024*1024)} MB)...")
+else:
+    print(f"Scanning stream in blocks of {chunk_size // (1024*1024)} MB...")
+
+try:
+    while True:
+        s_data = src.read(chunk_size)
+        if not s_data:
+            break
+        d_data = dst_read.read(len(s_data))
+
+        if s_data != d_data:
+            dst_write.seek(offset)
+            dst_write.write(s_data)
+            diff_bytes += len(s_data)
+            diff_chunks += 1
+
+        offset += len(s_data)
+        now = time.time()
+
+        if now - last_print >= 0.5 or (total_bytes > 0 and offset == total_bytes):
+            last_print = now
+            elapsed = max(now - start_time, 0.001)
+            speed_scan = (offset / elapsed) / (1024 * 1024)
+            pct = (offset / total_bytes * 100) if total_bytes > 0 else 0
+            diff_mb = diff_bytes / (1024 * 1024)
+            rem_seconds = int((total_bytes - offset) / (offset / elapsed)) if (total_bytes > 0 and offset > 0) else 0
+            eta_str = f"{rem_seconds // 60:02d}:{rem_seconds % 60:02d}"
+            sys.stdout.write(
+                f"\r[{pct:5.1f}%] {offset / (1024**3):.1f}/{total_bytes / (1024**3):.1f} GB "
+                f"| Scan: {speed_scan:5.1f} MB/s | Diff: {diff_mb:.1f} MB ({diff_chunks} blocks) | ETA: {eta_str}  "
+            )
+            sys.stdout.flush()
+
+    dst_write.flush()
+    os.fsync(dst_write.fileno())
+    sys.stdout.write("\n")
+except KeyboardInterrupt:
+    sys.stdout.write("\n[Interrupted] Flushing written blocks...\n")
+    dst_write.flush()
+    os.fsync(dst_write.fileno())
+    sys.exit(130)
+finally:
+    src.close()
+    dst_read.close()
+    dst_write.close()
+
+elapsed = max(time.time() - start_time, 0.001)
+skipped_bytes = total_bytes - diff_bytes
+skip_pct = (skipped_bytes / total_bytes * 100) if total_bytes > 0 else 100.0
+print(f"Diff sync complete in {elapsed:.1f}s!")
+print(f"Scanned: {total_bytes / (1024**3):.2f} GB | Modified: {diff_bytes / (1024**2):.1f} MB | Skipped (identical): {skip_pct:.1f}%")
+EOF
+  else
+    # Fallback to dd if python3 is not present
+    echo "Python 3 not found; falling back to full dd copy..."
+    dd if="$SRC" of="$DST" bs=4M conv=fsync status=progress
+  fi
+}
+
 merge-updates() {
   # Merge updates back into the master image.
 
@@ -1248,9 +1360,12 @@ case "$COMMAND" in
       bold "================ stop iscsi ================"
       stop-iscsi "${HOSTNAMES[@]}"
 
-      bold "================ merge overlay ================"
+      bold "================ merge overlay (smart diff) ================"
       unmount-master-locally
-      doit dd if="/dev/mapper/cached-$MERGE_HOST" of="/dev/$VGROUP/$BASE_IMAGE" bs=4M conv=fsync status=progress
+      diff-sync-devices "/dev/mapper/cached-$MERGE_HOST" "/dev/$VGROUP/$BASE_IMAGE" 2 || {
+        echo "ERROR: Diff merge failed or was interrupted. Overlays preserved." >&2
+        exit 1
+      }
 
       bold "================ delete overlays ================"
       delete-overlays "${HOSTNAMES[@]}"
