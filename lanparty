@@ -49,8 +49,10 @@ usage() {
   echo '    machine is updated and powered down, use "merge" to merge changes back'
   echo '    into the master image, or "destroy" to discard all changes.'
   echo
-  bold '  merge'
-  echo '    Merges updates (started with start-updates) into the master image.'
+  bold '  merge [HOST]'
+  echo '    Merges updates into the master image. If HOST is specified, merges the'
+  echo '    copy-on-write overlay of that specific host into the master image.'
+  echo '    Otherwise, merges updates started with "start-updates".'
   echo
   bold '  authorize-addr HOST ADDR'
   echo '    Authorize the IP address ADDR to attach to the iSCSI volume for HOST.'
@@ -1217,18 +1219,57 @@ case "$COMMAND" in
   merge )
     require-configured || exit 1
     require-root || exit 1
-    if [ "$#" -gt 0 ]; then
-      echo 'ERROR: "merge" does not take an argument.' >&2
+
+    if [ "$#" -gt 1 ]; then
+      echo 'ERROR: "merge" takes at most one argument (the host to merge).' >&2
       usage >&2
       exit 1
     fi
-    if ! is-updating; then
-      echo 'ERROR: No updates to merge.' >&2
-      exit 1
-    fi
 
-    stop-iscsi "${HOSTNAMES[@]}"
-    merge-updates
+    if [ "$#" -eq 1 ]; then
+      MERGE_HOST="$1"
+      validate-hostnames "$MERGE_HOST"
+
+      if [ ! -e "/dev/mapper/cached-$MERGE_HOST" ] && [ "$DRY_RUN" = no ]; then
+        echo "ERROR: No active overlay found at /dev/mapper/cached-$MERGE_HOST." >&2
+        exit 1
+      fi
+
+      if [ "$DRY_RUN" = no ]; then
+        STATUS=$(dmsetup status "cached-$MERGE_HOST" | cut -d' ' -f 4)
+        if [ "$STATUS" = "Invalid" ]; then
+          echo "ERROR: Overlay for $MERGE_HOST is exhausted and invalid. Cannot merge." >&2
+          exit 1
+        fi
+
+        yesno "Merge all changes from overlay for '$MERGE_HOST' into base image '$BASE_IMAGE'?" || exit 1
+      fi
+
+      bold "================ stop iscsi ================"
+      stop-iscsi "${HOSTNAMES[@]}"
+
+      bold "================ merge overlay ================"
+      unmount-master-locally
+      doit dd if="/dev/mapper/cached-$MERGE_HOST" of="/dev/$VGROUP/$BASE_IMAGE" bs=4M conv=fsync status=progress
+
+      bold "================ delete overlays ================"
+      delete-overlays "${HOSTNAMES[@]}"
+
+      if is-caching-enabled; then
+        doit losetup -d "$CACHE_LOOP_DEVICE"
+      fi
+
+      mount-master-locally
+      bold "Merge complete! You can now run '$SCRIPT_NAME init' to create fresh overlays from the updated base image."
+    else
+      if ! is-updating; then
+        echo 'ERROR: No updates to merge. If you updated a specific host, use: lanparty merge <HOST>' >&2
+        exit 1
+      fi
+
+      stop-iscsi "${HOSTNAMES[@]}"
+      merge-updates
+    fi
     ;;
 
   authorize-addr )
