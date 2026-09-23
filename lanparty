@@ -1453,6 +1453,16 @@ case "$COMMAND" in
 
     stop-iscsi "${HOSTNAMES[@]}"
     delete-overlays "${HOSTNAMES[@]}"
+
+    # If no games snapshots remain in the VG, restore GAMES_IMAGE to active read-write
+    if [ -n "${GAMES_IMAGE:-}" ]; then
+      if lvs "$VGROUP/$GAMES_IMAGE" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+        if [ "$DRY_RUN" = yes ] || ! lvs --noheadings -o origin "$VGROUP" 2>/dev/null | grep -qw "$GAMES_IMAGE"; then
+          doit lvchange -p rw "$VGROUP/$GAMES_IMAGE" || true
+          doit lvchange -ay "$VGROUP/$GAMES_IMAGE" || true
+        fi
+      fi
+    fi
     ;;
 
   boot )
