@@ -43,16 +43,10 @@ usage() {
   echo '    Shuts down the given hosts (default: all running hosts) by connecting to'
   echo '    each via SSH and issuing the configured shutdown command.'
   echo
-  bold '  start-updates HOST'
-  echo '    Initialize the given host for installing updates, using all unallocated'
-  echo '    disk space in the volume group for a copy-on-write overlay. Once the'
-  echo '    machine is updated and powered down, use "merge" to merge changes back'
-  echo '    into the master image, or "destroy" to discard all changes.'
-  echo
-  bold '  merge [HOST]'
-  echo '    Merges updates into the master image. If HOST is specified, merges the'
-  echo '    copy-on-write overlay of that specific host into the master image.'
-  echo '    Otherwise, merges updates started with "start-updates".'
+  bold '  merge HOST [os|games|all]'
+  echo '    Merges updates from the given host into the base images. The second argument'
+  echo '    specifies what to merge: "os" (smart diff merge on OS base image), "games"'
+  echo '    (thin delta sync on games base image), or "all" (both, default).'
   echo
   bold '  authorize-addr HOST ADDR'
   echo '    Authorize the IP address ADDR to attach to the iSCSI volume for HOST.'
@@ -116,11 +110,6 @@ yesno() {
   # TODO: Maybe we should assume "yes" when run non-interactively?
   echo "ERROR: Can't continue without user input."
   exit 1
-}
-
-is-updating() {
-  # Check if we're currently in update mode.
-  test -e "/dev/$VGROUP/updates"
 }
 
 is-local-mount-point-configured() {
@@ -286,9 +275,15 @@ stop-iscsi() {
         doit targetcli "/backstores/block delete $MACHINE"
         NEED_SLEEP=yes
       fi
+
+      # Also delete games backstore if it exists
+      if ls -d /sys/kernel/config/target/core/*/"$MACHINE-games" > /dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+        doit targetcli "/backstores/block delete $MACHINE-games"
+        NEED_SLEEP=yes
+      fi
     done
 
-    # If 'updates' backstore exists, delete it too
+    # If legacy 'updates' backstore exists, delete it too
     if ls -d /sys/kernel/config/target/core/*/updates > /dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
       doit targetcli "/backstores/block delete updates"
       NEED_SLEEP=yes
@@ -309,27 +304,29 @@ delete-overlays() {
   bold "================ delete overlays ================"
 
   for MACHINE in "$@"; do
-    if [ -e /dev/mapper/cached-$MACHINE ]; then
+    if [ -e /dev/mapper/cached-$MACHINE ] || [ "$DRY_RUN" = yes ]; then
       doit dmsetup remove /dev/mapper/cached-$MACHINE
     fi
-    if [ -e /dev/$VGROUP/$MACHINE-cow ]; then
-      doit lvremove -f /dev/$VGROUP/$MACHINE-cow
+    if [ -e "/dev/$VGROUP/$MACHINE-cow" ] || lvs "$VGROUP/$MACHINE-cow" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+      doit lvremove -f "/dev/$VGROUP/$MACHINE-cow"
+    fi
+    if [ -e "/dev/$VGROUP/$MACHINE-games" ] || lvs "$VGROUP/$MACHINE-games" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+      doit lvremove -f "/dev/$VGROUP/$MACHINE-games"
     fi
   done
 
-  # Also delete the updates image, if present.
+  # Also delete the legacy updates image, if present.
   if [ -e /dev/$VGROUP/updates ]; then
     doit lvremove -f /dev/$VGROUP/updates
   fi
 }
 
 create-overlays() {
-  # Set up disposable (non-updates) copy-on-write overlays for the given hostnames.
+  # Set up copy-on-write overlays for the given hostnames.
 
   bold "================ create overlays ================"
 
-  MASTER_SIZE=$(blockdev --getsz /dev/$VGROUP/$BASE_IMAGE)
-  EXTENTS=$(compute-extents $#)
+  MASTER_SIZE=$(blockdev --getsz "/dev/$VGROUP/$BASE_IMAGE" 2>/dev/null || echo 524288000)
 
   # Create the loopback layer -- for page caching -- over the master image, if it doesn't exist
   # already.
@@ -344,13 +341,51 @@ create-overlays() {
     mount-master-locally
   fi
 
-  for MACHINE in "$@"; do
-    # Create a regular volume with LVM.
-    doit lvcreate -n "$MACHINE-cow" -l $EXTENTS $VGROUP ${OVERLAY_DEVICE:-}
+  # If GAMES_IMAGE is configured, ensure it is set to read-only and deactivated for external-origin thin snapshotting
+  if [ -n "${GAMES_IMAGE:-}" ]; then
+    if lvs "$VGROUP/$GAMES_IMAGE" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+      local ATTRS=""
+      if [ "$DRY_RUN" = no ]; then
+        ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$GAMES_IMAGE" 2>/dev/null | tr -d ' ' || true)
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${ATTRS:1:1}" != "r" ]]; then
+        doit lvchange -p r "$VGROUP/$GAMES_IMAGE" || true
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${ATTRS:4:1}" == "a" ]]; then
+        doit lvchange -an "$VGROUP/$GAMES_IMAGE" || true
+      fi
+    else
+      echo "ERROR: Configured GAMES_IMAGE not found: $VGROUP/$GAMES_IMAGE" >&2
+      exit 1
+    fi
+  fi
 
-    # Use it as a raw devicemapper COW device.
+  for MACHINE in "$@"; do
+    # 1. OS Overlay
+    if [ -n "${THIN_POOL:-}" ]; then
+      # Thin-provisioned COW volume inside THIN_POOL (quota default: 150G)
+      doit lvcreate -V "${OS_COW_QUOTA:-150G}" -T "$VGROUP/$THIN_POOL" -n "$MACHINE-cow"
+    else
+      # Legacy thick extents
+      EXTENTS=$(compute-extents $#)
+      doit lvcreate -n "$MACHINE-cow" -l $EXTENTS $VGROUP ${OVERLAY_DEVICE:-}
+    fi
     doit dmsetup create cached-$MACHINE --table "0 $MASTER_SIZE snapshot $CACHE_LOOP_DEVICE /dev/$VGROUP/$MACHINE-cow N 128"
+
+    # 2. Games Thin Snapshot (if GAMES_IMAGE configured)
+    if [ -n "${GAMES_IMAGE:-}" ]; then
+      if [ -n "${THIN_POOL:-}" ]; then
+        doit lvcreate -s -n "$MACHINE-games" "$VGROUP/$GAMES_IMAGE" --thinpool "$VGROUP/$THIN_POOL"
+      else
+        echo "ERROR: GAMES_IMAGE requires THIN_POOL to be configured." >&2
+        exit 1
+      fi
+    fi
   done
+
+  if [ "$DRY_RUN" = no ]; then
+    udevadm settle 2>/dev/null || true
+  fi
 }
 
 diff-sync-devices() {
@@ -465,46 +500,163 @@ EOF
   fi
 }
 
-merge-updates() {
-  # Merge updates back into the master image.
+thin-delta-sync() {
+  # Perform a fast delta block sync from a thin snapshot ($1) to its base image ($2)
+  # using thin pool metadata to copy ONLY modified blocks.
+  local SRC="$1"
+  local DST="$2"
+  local POOL="$3"
+  local VG="$4"
 
-  bold "================ merge overlay ================"
-
-  unmount-master-locally
-  doit lvconvert --merge /dev/$VGROUP/updates
-  mount-master-locally
-}
-
-start-updates() {
-  # Set up a copy-on-write overlay for installing updates.
-
-  bold "================ create overlay ================"
-
-  EXTENTS=$(compute-extents 1)
-
-  # Remove the loopback layer, if it currently exists.
-  if is-caching-enabled; then
-    unmount-master-locally
-    doit losetup -d $CACHE_LOOP_DEVICE
-    mount-master-locally
+  if [ "$DRY_RUN" = yes ]; then
+    echo-command "thin-delta-sync $SRC -> $DST (pool: $VG/$POOL)"
+    return 0
   fi
 
-  # Creating the updates machine. Use a regular LVM snapshot so that we can easily merge it back
-  # later.
-  doit lvcreate -c 64k -n updates -l $EXTENTS -s /dev/$VGROUP/$BASE_IMAGE ${OVERLAY_DEVICE:-}
+  if [ -z "$POOL" ]; then
+    echo "ERROR: THIN_POOL must be specified for thin delta sync." >&2
+    return 1
+  fi
+
+  # Get the thin device ID of the snapshot
+  local THIN_ID
+  THIN_ID=$(lvs --noheadings -o thin_id "$SRC" 2>/dev/null | tr -d ' ')
+  if [ -z "$THIN_ID" ]; then
+    echo "WARNING: Could not determine thin ID for $SRC; falling back to smart diff scan..."
+    diff-sync-devices "$SRC" "$DST" 4
+    return $?
+  fi
+
+  local META_DEV="/dev/mapper/${VG}-${POOL}_tmeta"
+  if [ ! -e "$META_DEV" ]; then
+    META_DEV="/dev/$VG/${POOL}_tmeta"
+  fi
+
+  local XML_FILE
+  XML_FILE=$(mktemp /tmp/thin_dump_XXXXXX.xml)
+
+  # Attempt metadata dump using thin_dump -m (live metadata snapshot)
+  if ! thin_dump -m --dev-id "$THIN_ID" "$META_DEV" > "$XML_FILE" 2>/dev/null; then
+    # Fallback to reserve_metadata_snap message if needed
+    dmsetup message "/dev/mapper/${VG}-${POOL}-tpool" 0 reserve_metadata_snap 2>/dev/null || true
+    thin_dump --dev-id "$THIN_ID" "$META_DEV" > "$XML_FILE" 2>/dev/null || true
+    dmsetup message "/dev/mapper/${VG}-${POOL}-tpool" 0 release_metadata_snap 2>/dev/null || true
+  fi
+
+  if [ ! -s "$XML_FILE" ]; then
+    echo "WARNING: thin_dump could not extract mappings for thin ID $THIN_ID; falling back to smart diff scan..."
+    rm -f "$XML_FILE"
+    diff-sync-devices "$SRC" "$DST" 4
+    return $?
+  fi
+
+  python3 - "$SRC" "$DST" "$XML_FILE" << 'EOF'
+import sys, os, time
+import xml.etree.ElementTree as ET
+
+src_path = sys.argv[1]
+dst_path = sys.argv[2]
+xml_path = sys.argv[3]
+
+try:
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+except Exception as e:
+    sys.stderr.write(f"ERROR: Failed to parse thin_dump XML: {e}\n")
+    sys.exit(1)
+
+# data_block_size is in sectors (512 bytes)
+data_block_sectors = int(root.attrib.get("data_block_size", "128"))
+chunk_size = data_block_sectors * 512
+
+ranges = []
+for dev in root.findall("device"):
+    for mapping in dev:
+        if mapping.tag == "range_mapping":
+            origin_begin = int(mapping.attrib["origin_begin"])
+            length = int(mapping.attrib["length"])
+            ranges.append((origin_begin * chunk_size, length * chunk_size))
+        elif mapping.tag == "single_mapping":
+            origin_block = int(mapping.attrib["origin_block"])
+            ranges.append((origin_block * chunk_size, chunk_size))
+
+ranges.sort(key=lambda r: r[0])
+merged_ranges = []
+for off, sz in ranges:
+    if merged_ranges and (merged_ranges[-1][0] + merged_ranges[-1][1] == off and merged_ranges[-1][1] + sz <= 32 * 1024 * 1024):
+        merged_ranges[-1] = (merged_ranges[-1][0], merged_ranges[-1][1] + sz)
+    else:
+        merged_ranges.append((off, sz))
+
+total_bytes = sum(length for _, length in merged_ranges)
+print(f"Extracted {len(ranges)} delta mappings ({len(merged_ranges)} contiguous runs) totaling {total_bytes / (1024**2):.1f} MB.")
+
+if total_bytes == 0:
+    print("No modified blocks detected in snapshot.")
+    sys.exit(0)
+
+try:
+    src = open(src_path, "rb")
+    dst = open(dst_path, "r+b")
+except Exception as e:
+    sys.stderr.write(f"ERROR: Failed to open devices for delta sync: {e}\n")
+    sys.exit(1)
+
+copied_bytes = 0
+start_time = time.time()
+last_print = start_time
+
+try:
+    for offset, length in merged_ranges:
+        src.seek(offset)
+        dst.seek(offset)
+        rem = length
+        while rem > 0:
+            read_sz = min(rem, 4 * 1024 * 1024)
+            data = src.read(read_sz)
+            if not data:
+                break
+            dst.write(data)
+            rem -= len(data)
+            copied_bytes += len(data)
+
+            now = time.time()
+            if now - last_print >= 0.5 or copied_bytes == total_bytes:
+                last_print = now
+                elapsed = max(now - start_time, 0.001)
+                speed = (copied_bytes / elapsed) / (1024 * 1024)
+                pct = (copied_bytes / total_bytes * 100)
+                sys.stdout.write(f"\r[{pct:5.1f}%] {copied_bytes / (1024**2):.1f}/{total_bytes / (1024**2):.1f} MB written | Speed: {speed:5.1f} MB/s  ")
+                sys.stdout.flush()
+
+    dst.flush()
+    os.fsync(dst.fileno())
+    sys.stdout.write("\n")
+except KeyboardInterrupt:
+    sys.stdout.write("\n[Interrupted] Flushing written blocks...\n")
+    dst.flush()
+    os.fsync(dst.fileno())
+    sys.exit(130)
+finally:
+    src.close()
+    dst.close()
+
+elapsed = max(time.time() - start_time, 0.001)
+print(f"Delta merge complete: {total_bytes / (1024**2):.1f} MB written in {elapsed:.1f}s (Speed: {(total_bytes / elapsed) / (1024**2):.1f} MB/s)!")
+EOF
+  local RET=$?
+  rm -f "$XML_FILE"
+  return $RET
 }
 
 start-iscsi() {
   # Instruct the iSCSI server (LIO) to publish the volumes for the given hostnames.
-  #
-  # The first argument to start-iscsi must be either "updates" if we're publishing the update
-  # volume, or "cached" if we're publishing disposable volumes. The remaining arguments are the
-  # hostnames. (There should normally be only one hostname when publishing updates.)
-
   bold "================ start iscsi ================"
 
-  local SOURCE=$1
-  shift
+  # If first argument is 'cached' (legacy invocation), shift it off
+  if [ "${1:-}" = "cached" ] || [ "${1:-}" = "updates" ]; then
+    shift
+  fi
 
   # If legacy tgtd is running, terminate it so it doesn't hold port 3260
   if pidof tgtd > /dev/null; then
@@ -524,33 +676,28 @@ start-iscsi() {
   doit targetcli set global auto_save_on_exit=false
 
   for MACHINE in "$@"; do
-    case $SOURCE in
-      updates )
-        DEVICE=/dev/$VGROUP/updates
-        BACKSTORE=updates
-        ;;
-      cached )
-        DEVICE=/dev/mapper/cached-$MACHINE
-        BACKSTORE=$MACHINE
-        ;;
-      * )
-        echo "internal error: start-iscsi bad parameters" >&2
-        exit 1;
-    esac
-
     local TARGET_IQN="$ISCSI_TARGET_PREFIX:$MACHINE"
 
-    # Create kernel-space direct block backstore (iblock submits bio directly to device-mapper/LVM)
-    doit targetcli "/backstores/block create name=$BACKSTORE dev=$DEVICE"
-
-    # Create iSCSI target
+    # 1. OS Backstore & LUN 1 (matches initiator DHCP configuration :::1:)
+    doit targetcli "/backstores/block create name=$MACHINE dev=/dev/mapper/cached-$MACHINE"
     doit targetcli "/iscsi create $TARGET_IQN"
-
-    # Bind portal strictly to configured internal server address
     doit targetcli "/iscsi/$TARGET_IQN/tpg1/portals create $SERVER_ADDR 3260"
+    doit targetcli "/iscsi/$TARGET_IQN/tpg1/luns create /backstores/block/$MACHINE 1"
 
-    # Map backstore to LUN 1 (matches initiator DHCP configuration :::1:)
-    doit targetcli "/iscsi/$TARGET_IQN/tpg1/luns create /backstores/block/$BACKSTORE 1"
+    # 2. Games Backstore & LUN 2 (if GAMES_IMAGE configured)
+    if [ -n "${GAMES_IMAGE:-}" ]; then
+      local GDEV="/dev/$VGROUP/$MACHINE-games"
+      if [ ! -e "$GDEV" ] && [ -e "/dev/mapper/${VGROUP}-${MACHINE}--games" ]; then
+        GDEV="/dev/mapper/${VGROUP}-${MACHINE}--games"
+      fi
+      if [ -e "$GDEV" ] || lvs "$VGROUP/$MACHINE-games" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+        local GLUN="${GAMES_LUN:-2}"
+        doit targetcli "/backstores/block create name=$MACHINE-games dev=$GDEV"
+        doit targetcli "/iscsi/$TARGET_IQN/tpg1/luns create /backstores/block/$MACHINE-games $GLUN"
+      else
+        echo "WARNING: Games snapshot $GDEV not found; skipping LUN 2 for $MACHINE." >&2
+      fi
+    fi
 
     # Set up open demo mode for dynamic initiator connections with full write access
     doit targetcli "/iscsi/$TARGET_IQN/tpg1 set attribute authentication=0"
@@ -624,32 +771,42 @@ show-status() {
   # Show the status of all overlays, in particular what percentage of the overlay space has been
   # consumed.
 
-  if is-updating; then
-    # In updates mode, the overlay is an LVM snapshot. Query using lvdisplay.
-    PERCENT=$(lvdisplay "/dev/$VGROUP/updates" |
-              grep "Allocated to snapshot" |
-              sed -e 's/ *Allocated to snapshot *//')
-    echo "updates: ${PERCENT}"
-  else
-    # In regular mode, the overlays are raw device-mapper devices. Query using dmsetup.
-    for MACHINE in "$@"; do
-      if [ -e "/dev/mapper/cached-$MACHINE" ]; then
-        STATUS=$(dmsetup status "cached-$MACHINE" | cut -d' ' -f 4)
-        if [ "$STATUS" = Invalid ]; then
-          # This machine's overlay was filled up. The volume no longer works.
-          echo "$MACHINE: exhausted"
-        else
-          # dmsetup gives us a ratio of extents used vs. total, like "1234/4321". We want a
-          # percentage.
-          PERCENT=$(ratio-to-percent "$STATUS")
-          echo "$MACHINE: $PERCENT%"
-        fi
-      else
-        # This overlay is not currently configured.
-        echo "$MACHINE: offline"
-      fi
-    done
+  if [ -n "${THIN_POOL:-}" ]; then
+    echo "--- Scratch Thin Pool ($VGROUP/$THIN_POOL) ---"
+    if lvs "$VGROUP/$THIN_POOL" > /dev/null 2>&1; then
+      lvs -o lv_name,lv_size,data_percent,metadata_percent "$VGROUP/$THIN_POOL" 2>/dev/null || true
+    else
+      echo "Thin pool $VGROUP/$THIN_POOL not found."
+    fi
+    echo
   fi
+
+  echo "--- Node Overlays ---"
+  for MACHINE in "$@"; do
+    local OS_STAT="offline"
+    local GAMES_STAT=""
+
+    if [ -e "/dev/mapper/cached-$MACHINE" ]; then
+      STATUS=$(dmsetup status "cached-$MACHINE" 2>/dev/null | cut -d' ' -f 4 || true)
+      if [ "$STATUS" = Invalid ]; then
+        OS_STAT="exhausted"
+      elif [ -n "$STATUS" ]; then
+        PERCENT=$(ratio-to-percent "$STATUS")
+        OS_STAT="$PERCENT%"
+      fi
+    fi
+
+    if [ -n "${GAMES_IMAGE:-}" ]; then
+      if [ -e "/dev/$VGROUP/$MACHINE-games" ] || lvs "$VGROUP/$MACHINE-games" >/dev/null 2>&1; then
+        G_PCT=$(lvs --noheadings -o data_percent "$VGROUP/$MACHINE-games" 2>/dev/null | tr -d ' ' || true)
+        GAMES_STAT=" | games: ${G_PCT:-0.00}%"
+      else
+        GAMES_STAT=" | games: offline"
+      fi
+    fi
+
+    echo "$MACHINE: os: $OS_STAT$GAMES_STAT"
+  done
 }
 
 # ========================================================================================
@@ -830,6 +987,28 @@ CACHE_LOOP_DEVICE=/dev/loop7
 # from disk for every client; we want all clients after the first to get the
 # cached copy. Using a loopback device stacked on top of a block device node
 # accomplishes this.
+
+#GAMES_IMAGE=games
+# OPTIONAL: LVM logical volume containing the predownloaded game library
+# (e.g. 4TB RAID 0). When configured, this drive is exported to Windows
+# initiators as a secondary iSCSI drive (LUN 2) with a Copy-on-Write thin
+# snapshot on the scratch drive. Leave commented out if using a single OS drive.
+
+#GAMES_LUN=2
+# iSCSI LUN number for the game drive (default: 2).
+
+#THIN_POOL=scratchpool
+# OPTIONAL: LVM thin pool name on the scratch SSD (within \$VGROUP).
+# When configured, per-machine overlays and game snapshots are allocated as
+# thin volumes sharing this single dynamic pool, avoiding rigid static
+# partitioning and enabling SCSI UNMAP / TRIM.
+
+#OS_COW_QUOTA=150G
+# Virtual size / quota limit for each node's OS overlay in the thin pool.
+# (Default: 150G). Space is allocated on demand as blocks are written.
+
+#GAMES_SNAPSHOT_QUOTA=350G
+# Quota limit for each node's game drive snapshot. (Default: 350G).
 
 #LOCAL_MOUNT_POINT=/mnt/master
 # OPTIONAL: Mount the base image, read-only, to this directory on the server.
@@ -1253,10 +1432,6 @@ case "$COMMAND" in
   init )
     require-configured || exit 1
     require-root || exit 1
-    if is-updating; then
-      echo "ERROR: You must either merge or destroy updates first." >&2
-      exit 1
-    fi
     if [ "$#" -gt 0 ]; then
       validate-hostnames "$@"
       HOSTNAMES=("$@")
@@ -1265,15 +1440,12 @@ case "$COMMAND" in
     stop-iscsi "${HOSTNAMES[@]}"
     delete-overlays "${HOSTNAMES[@]}"
     create-overlays "${HOSTNAMES[@]}"
-    start-iscsi cached "${HOSTNAMES[@]}"
+    start-iscsi "${HOSTNAMES[@]}"
     ;;
 
   destroy )
     require-configured || exit 1
     require-root || exit 1
-    if is-updating; then
-      yesno "There are unmerged updates. Really destroy them?" || exit 1
-    fi
     if [ "$#" -gt 0 ]; then
       validate-hostnames "$@"
       HOSTNAMES=("$@")
@@ -1281,6 +1453,16 @@ case "$COMMAND" in
 
     stop-iscsi "${HOSTNAMES[@]}"
     delete-overlays "${HOSTNAMES[@]}"
+
+    # If no games snapshots remain in the VG, restore GAMES_IMAGE to active read-write
+    if [ -n "${GAMES_IMAGE:-}" ]; then
+      if lvs "$VGROUP/$GAMES_IMAGE" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+        if [ "$DRY_RUN" = yes ] || ! lvs --noheadings -o origin "$VGROUP" 2>/dev/null | grep -qw "$GAMES_IMAGE"; then
+          doit lvchange -p rw "$VGROUP/$GAMES_IMAGE" || true
+          doit lvchange -ay "$VGROUP/$GAMES_IMAGE" || true
+        fi
+      fi
+    fi
     ;;
 
   boot )
@@ -1304,87 +1486,150 @@ case "$COMMAND" in
     shutdown-hosts "${HOSTNAMES[@]}"
     ;;
 
-  start-updates )
-    require-configured || exit 1
-    require-root || exit 1
-    if [ "$#" -ne 1 ]; then
-      echo 'ERROR: "start-updates" takes exactly one argument.' >&2
-      usage >&2
-      exit 1
-    fi
-    if is-updating; then
-      echo "ERROR: Updates are already in progress." >&2
-      exit 1
-    fi
-    UPDATE_MACHINE="$1"
-    if [ "${HOST_TO_NUMBER[$UPDATE_MACHINE]:-none}" == "none" ]; then
-      echo "ERROR: No such host configured: $UPDATE_MACHINE" >&2
-      exit 1
-    fi
-
-    stop-iscsi "${HOSTNAMES[@]}"
-    delete-overlays "${HOSTNAMES[@]}"
-    start-updates
-    start-iscsi updates "$UPDATE_MACHINE"
-    ;;
-
   merge )
     require-configured || exit 1
     require-root || exit 1
 
-    if [ "$#" -gt 1 ]; then
-      echo 'ERROR: "merge" takes at most one argument (the host to merge).' >&2
-      usage >&2
+    if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+      echo 'ERROR: "merge" requires a host argument and optional volume target.' >&2
+      echo 'Usage: lanparty merge <HOST> [os|games|all]' >&2
       exit 1
     fi
 
-    if [ "$#" -eq 1 ]; then
-      MERGE_HOST="$1"
-      validate-hostnames "$MERGE_HOST"
+    MERGE_HOST="$1"
+    TARGET_VOL="${2:-all}"
+    validate-hostnames "$MERGE_HOST"
 
+    case "$TARGET_VOL" in
+      os | games | all )
+        ;;
+      * )
+        echo "ERROR: Invalid volume target '$TARGET_VOL'. Must be one of: os, games, all" >&2
+        exit 1
+        ;;
+    esac
+
+    # Validate prerequisites depending on target
+    if [ "$TARGET_VOL" = "os" ] || [ "$TARGET_VOL" = "all" ]; then
       if [ ! -e "/dev/mapper/cached-$MERGE_HOST" ] && [ "$DRY_RUN" = no ]; then
-        echo "ERROR: No active overlay found at /dev/mapper/cached-$MERGE_HOST." >&2
+        echo "ERROR: No active OS overlay found at /dev/mapper/cached-$MERGE_HOST." >&2
         exit 1
       fi
-
       if [ "$DRY_RUN" = no ]; then
-        STATUS=$(dmsetup status "cached-$MERGE_HOST" | cut -d' ' -f 4)
+        STATUS=$(dmsetup status "cached-$MERGE_HOST" 2>/dev/null | cut -d' ' -f 4 || true)
         if [ "$STATUS" = "Invalid" ]; then
-          echo "ERROR: Overlay for $MERGE_HOST is exhausted and invalid. Cannot merge." >&2
+          echo "ERROR: OS overlay for $MERGE_HOST is exhausted and invalid. Cannot merge." >&2
           exit 1
         fi
-
-        yesno "Merge all changes from overlay for '$MERGE_HOST' into base image '$BASE_IMAGE'?" || exit 1
       fi
+    fi
 
-      bold "================ stop iscsi ================"
-      stop-iscsi "${HOSTNAMES[@]}"
+    if [ "$TARGET_VOL" = "games" ] || [ "$TARGET_VOL" = "all" ]; then
+      if [ -n "${GAMES_IMAGE:-}" ]; then
+        if [ ! -e "/dev/$VGROUP/$MERGE_HOST-games" ] && ! lvs "$VGROUP/$MERGE_HOST-games" >/dev/null 2>&1 && [ "$DRY_RUN" = no ]; then
+          echo "ERROR: No active games snapshot found at /dev/$VGROUP/$MERGE_HOST-games." >&2
+          exit 1
+        fi
+      elif [ "$TARGET_VOL" = "games" ]; then
+        echo "ERROR: GAMES_IMAGE is not configured in $CONFIG_NAME." >&2
+        exit 1
+      fi
+    fi
 
-      bold "================ merge overlay (smart diff) ================"
+    if [ "$DRY_RUN" = no ]; then
+      yesno "Merge changes ($TARGET_VOL) for '$MERGE_HOST' into base storage?" || exit 1
+    fi
+
+    bold "================ stop iscsi ================"
+    stop-iscsi "$MERGE_HOST"
+
+    # Merge OS volume
+    if [ "$TARGET_VOL" = "os" ] || [ "$TARGET_VOL" = "all" ]; then
+      bold "================ merge OS overlay (smart diff) ================"
       unmount-master-locally
       diff-sync-devices "/dev/mapper/cached-$MERGE_HOST" "/dev/$VGROUP/$BASE_IMAGE" 2 || {
-        echo "ERROR: Diff merge failed or was interrupted. Overlays preserved." >&2
+        echo "ERROR: OS diff merge failed or was interrupted. Overlays preserved." >&2
         exit 1
       }
 
-      bold "================ delete overlays ================"
-      delete-overlays "${HOSTNAMES[@]}"
+      bold "================ reset OS overlay for $MERGE_HOST ================"
+      if [ -e "/dev/mapper/cached-$MERGE_HOST" ]; then
+        doit dmsetup remove "/dev/mapper/cached-$MERGE_HOST"
+      fi
+      if [ -e "/dev/$VGROUP/$MERGE_HOST-cow" ]; then
+        doit lvremove -f "/dev/$VGROUP/$MERGE_HOST-cow"
+      fi
 
       if is-caching-enabled; then
         doit losetup -d "$CACHE_LOOP_DEVICE"
       fi
-
       mount-master-locally
-      bold "Merge complete! You can now run '$SCRIPT_NAME init' to create fresh overlays from the updated base image."
-    else
-      if ! is-updating; then
-        echo 'ERROR: No updates to merge. If you updated a specific host, use: lanparty merge <HOST>' >&2
-        exit 1
+
+      # Recreate fresh OS overlay
+      MASTER_SIZE=$(blockdev --getsz "/dev/$VGROUP/$BASE_IMAGE" 2>/dev/null || echo 524288000)
+      if ! is-caching-enabled; then
+        unmount-master-locally
+        if losetup "$CACHE_LOOP_DEVICE" > /dev/null 2>&1; then
+          doit losetup -d "$CACHE_LOOP_DEVICE"
+        fi
+        doit losetup --direct-io=off --read-only "$CACHE_LOOP_DEVICE" "/dev/$VGROUP/$BASE_IMAGE"
+        mount-master-locally
       fi
 
-      stop-iscsi "${HOSTNAMES[@]}"
-      merge-updates
+      if [ -n "${THIN_POOL:-}" ]; then
+        doit lvcreate -V "${OS_COW_QUOTA:-150G}" -T "$VGROUP/$THIN_POOL" -n "$MERGE_HOST-cow"
+      else
+        EXTENTS=$(compute-extents 1)
+        doit lvcreate -n "$MERGE_HOST-cow" -l $EXTENTS $VGROUP ${OVERLAY_DEVICE:-}
+      fi
+      doit dmsetup create "cached-$MERGE_HOST" --table "0 $MASTER_SIZE snapshot $CACHE_LOOP_DEVICE /dev/$VGROUP/$MERGE_HOST-cow N 128"
     fi
+
+    # Merge Games volume
+    if ([ "$TARGET_VOL" = "games" ] || [ "$TARGET_VOL" = "all" ]) && [ -n "${GAMES_IMAGE:-}" ]; then
+      bold "================ merge Games snapshot (thin delta) ================"
+      local G_ATTRS=""
+      if [ "$DRY_RUN" = no ]; then
+        G_ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$GAMES_IMAGE" 2>/dev/null | tr -d ' ' || true)
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${G_ATTRS:4:1}" != "a" ]]; then
+        doit lvchange -ay -K "$VGROUP/$GAMES_IMAGE" 2>/dev/null || doit lvchange -ay "$VGROUP/$GAMES_IMAGE" || true
+      fi
+      if [ -e "/dev/$VGROUP/$GAMES_IMAGE" ] || [ "$DRY_RUN" = yes ]; then
+        doit blockdev --setrw "/dev/$VGROUP/$GAMES_IMAGE" || true
+      fi
+
+      local SRC_GDEV="/dev/$VGROUP/$MERGE_HOST-games"
+      if [ ! -e "$SRC_GDEV" ] && [ -e "/dev/mapper/${VGROUP}-${MERGE_HOST}--games" ]; then
+        SRC_GDEV="/dev/mapper/${VGROUP}-${MERGE_HOST}--games"
+      fi
+
+      thin-delta-sync "$SRC_GDEV" "/dev/$VGROUP/$GAMES_IMAGE" "$THIN_POOL" "$VGROUP" || {
+        echo "ERROR: Games delta merge failed or was interrupted. Snapshot preserved." >&2
+        exit 1
+      }
+
+      bold "================ reset Games snapshot for $MERGE_HOST ================"
+      if [ -e "/dev/$VGROUP/$MERGE_HOST-games" ] || lvs "$VGROUP/$MERGE_HOST-games" >/dev/null 2>&1; then
+        doit lvremove -f "$VGROUP/$MERGE_HOST-games"
+      fi
+      local POST_ATTRS=""
+      if [ "$DRY_RUN" = no ]; then
+        POST_ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$GAMES_IMAGE" 2>/dev/null | tr -d ' ' || true)
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${POST_ATTRS:1:1}" != "r" ]]; then
+        doit lvchange -p r "$VGROUP/$GAMES_IMAGE" || true
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${POST_ATTRS:4:1}" == "a" ]]; then
+        doit lvchange -an "$VGROUP/$GAMES_IMAGE" || true
+      fi
+      doit lvcreate -s -n "$MERGE_HOST-games" "$VGROUP/$GAMES_IMAGE" --thinpool "$VGROUP/$THIN_POOL"
+    fi
+
+    # Republish LIO iSCSI targets for the merged host so it is ready to boot
+    start-iscsi "$MERGE_HOST"
+
+    bold "Merge complete for $MERGE_HOST ($TARGET_VOL)! Overlays have been refreshed from base images."
     ;;
 
   authorize-addr )
