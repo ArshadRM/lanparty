@@ -307,11 +307,11 @@ delete-overlays() {
     if [ -e /dev/mapper/cached-$MACHINE ] || [ "$DRY_RUN" = yes ]; then
       doit dmsetup remove /dev/mapper/cached-$MACHINE
     fi
-    if [ -e /dev/$VGROUP/$MACHINE-cow ] || [ "$DRY_RUN" = yes ]; then
-      doit lvremove -f /dev/$VGROUP/$MACHINE-cow
+    if [ -e "/dev/$VGROUP/$MACHINE-cow" ] || lvs "$VGROUP/$MACHINE-cow" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+      doit lvremove -f "/dev/$VGROUP/$MACHINE-cow"
     fi
-    if [ -e /dev/$VGROUP/$MACHINE-games ] || [ "$DRY_RUN" = yes ]; then
-      doit lvremove -f /dev/$VGROUP/$MACHINE-games
+    if [ -e "/dev/$VGROUP/$MACHINE-games" ] || lvs "$VGROUP/$MACHINE-games" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+      doit lvremove -f "/dev/$VGROUP/$MACHINE-games"
     fi
   done
 
@@ -341,12 +341,13 @@ create-overlays() {
     mount-master-locally
   fi
 
-  # If GAMES_IMAGE is configured, ensure it is set to read-only for external-origin thin snapshotting
+  # If GAMES_IMAGE is configured, ensure it is set to read-only and deactivated for external-origin thin snapshotting
   if [ -n "${GAMES_IMAGE:-}" ]; then
-    if [ -e "/dev/$VGROUP/$GAMES_IMAGE" ] || [ "$DRY_RUN" = yes ]; then
-      doit lvchange -p r "/dev/$VGROUP/$GAMES_IMAGE"
+    if lvs "$VGROUP/$GAMES_IMAGE" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+      doit lvchange -p r "$VGROUP/$GAMES_IMAGE"
+      doit lvchange -an "$VGROUP/$GAMES_IMAGE"
     else
-      echo "ERROR: Configured GAMES_IMAGE not found at /dev/$VGROUP/$GAMES_IMAGE" >&2
+      echo "ERROR: Configured GAMES_IMAGE not found: $VGROUP/$GAMES_IMAGE" >&2
       exit 1
     fi
   fi
@@ -366,7 +367,7 @@ create-overlays() {
     # 2. Games Thin Snapshot (if GAMES_IMAGE configured)
     if [ -n "${GAMES_IMAGE:-}" ]; then
       if [ -n "${THIN_POOL:-}" ]; then
-        doit lvcreate -s -n "$MACHINE-games" "/dev/$VGROUP/$GAMES_IMAGE" --thinpool "$VGROUP/$THIN_POOL"
+        doit lvcreate -s -n "$MACHINE-games" "$VGROUP/$GAMES_IMAGE" --thinpool "$VGROUP/$THIN_POOL"
       else
         echo "ERROR: GAMES_IMAGE requires THIN_POOL to be configured." >&2
         exit 1
@@ -776,8 +777,8 @@ show-status() {
     fi
 
     if [ -n "${GAMES_IMAGE:-}" ]; then
-      if [ -e "/dev/$VGROUP/$MACHINE-games" ]; then
-        G_PCT=$(lvs --noheadings -o data_percent "/dev/$VGROUP/$MACHINE-games" 2>/dev/null | tr -d ' ' || true)
+      if [ -e "/dev/$VGROUP/$MACHINE-games" ] || lvs "$VGROUP/$MACHINE-games" >/dev/null 2>&1; then
+        G_PCT=$(lvs --noheadings -o data_percent "$VGROUP/$MACHINE-games" 2>/dev/null | tr -d ' ' || true)
         GAMES_STAT=" | games: ${G_PCT:-0.00}%"
       else
         GAMES_STAT=" | games: offline"
@@ -1495,7 +1496,7 @@ case "$COMMAND" in
 
     if [ "$TARGET_VOL" = "games" ] || [ "$TARGET_VOL" = "all" ]; then
       if [ -n "${GAMES_IMAGE:-}" ]; then
-        if [ ! -e "/dev/$VGROUP/$MERGE_HOST-games" ] && [ "$DRY_RUN" = no ]; then
+        if [ ! -e "/dev/$VGROUP/$MERGE_HOST-games" ] && ! lvs "$VGROUP/$MERGE_HOST-games" >/dev/null 2>&1 && [ "$DRY_RUN" = no ]; then
           echo "ERROR: No active games snapshot found at /dev/$VGROUP/$MERGE_HOST-games." >&2
           exit 1
         fi
@@ -1557,17 +1558,27 @@ case "$COMMAND" in
     # Merge Games volume
     if ([ "$TARGET_VOL" = "games" ] || [ "$TARGET_VOL" = "all" ]) && [ -n "${GAMES_IMAGE:-}" ]; then
       bold "================ merge Games snapshot (thin delta) ================"
+      doit lvchange -ay -K "$VGROUP/$GAMES_IMAGE" 2>/dev/null || doit lvchange -ay "$VGROUP/$GAMES_IMAGE"
+      if [ -e "/dev/$VGROUP/$GAMES_IMAGE" ] || [ "$DRY_RUN" = yes ]; then
+        doit blockdev --setrw "/dev/$VGROUP/$GAMES_IMAGE"
+      fi
+
       thin-delta-sync "/dev/$VGROUP/$MERGE_HOST-games" "/dev/$VGROUP/$GAMES_IMAGE" "$THIN_POOL" "$VGROUP" || {
         echo "ERROR: Games delta merge failed or was interrupted. Snapshot preserved." >&2
         exit 1
       }
 
       bold "================ reset Games snapshot for $MERGE_HOST ================"
-      if [ -e "/dev/$VGROUP/$MERGE_HOST-games" ]; then
+      if [ -e "/dev/$VGROUP/$MERGE_HOST-games" ] || lvs "$VGROUP/$MERGE_HOST-games" >/dev/null 2>&1; then
         doit lvremove -f "/dev/$VGROUP/$MERGE_HOST-games"
       fi
-      doit lvcreate -s -n "$MERGE_HOST-games" "/dev/$VGROUP/$GAMES_IMAGE" --thinpool "$VGROUP/$THIN_POOL"
+      doit lvchange -p r "$VGROUP/$GAMES_IMAGE"
+      doit lvchange -an "$VGROUP/$GAMES_IMAGE"
+      doit lvcreate -s -n "$MERGE_HOST-games" "$VGROUP/$GAMES_IMAGE" --thinpool "$VGROUP/$THIN_POOL"
     fi
+
+    # Republish LIO iSCSI targets for the merged host so it is ready to boot
+    start-iscsi "$MERGE_HOST"
 
     bold "Merge complete for $MERGE_HOST ($TARGET_VOL)! Overlays have been refreshed from base images."
     ;;
