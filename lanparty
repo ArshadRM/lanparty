@@ -344,8 +344,16 @@ create-overlays() {
   # If GAMES_IMAGE is configured, ensure it is set to read-only and deactivated for external-origin thin snapshotting
   if [ -n "${GAMES_IMAGE:-}" ]; then
     if lvs "$VGROUP/$GAMES_IMAGE" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
-      doit lvchange -p r "$VGROUP/$GAMES_IMAGE"
-      doit lvchange -an "$VGROUP/$GAMES_IMAGE"
+      local ATTRS=""
+      if [ "$DRY_RUN" = no ]; then
+        ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$GAMES_IMAGE" 2>/dev/null | tr -d ' ' || true)
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${ATTRS:1:1}" != "r" ]]; then
+        doit lvchange -p r "$VGROUP/$GAMES_IMAGE" || true
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${ATTRS:4:1}" == "a" ]]; then
+        doit lvchange -an "$VGROUP/$GAMES_IMAGE" || true
+      fi
     else
       echo "ERROR: Configured GAMES_IMAGE not found: $VGROUP/$GAMES_IMAGE" >&2
       exit 1
@@ -374,6 +382,10 @@ create-overlays() {
       fi
     fi
   done
+
+  if [ "$DRY_RUN" = no ]; then
+    udevadm settle 2>/dev/null || true
+  fi
 }
 
 diff-sync-devices() {
@@ -673,10 +685,18 @@ start-iscsi() {
     doit targetcli "/iscsi/$TARGET_IQN/tpg1/luns create /backstores/block/$MACHINE 1"
 
     # 2. Games Backstore & LUN 2 (if GAMES_IMAGE configured)
-    if [ -n "${GAMES_IMAGE:-}" ] && ([ -e "/dev/$VGROUP/$MACHINE-games" ] || [ "$DRY_RUN" = yes ]); then
-      local GLUN="${GAMES_LUN:-2}"
-      doit targetcli "/backstores/block create name=$MACHINE-games dev=/dev/$VGROUP/$MACHINE-games"
-      doit targetcli "/iscsi/$TARGET_IQN/tpg1/luns create /backstores/block/$MACHINE-games $GLUN"
+    if [ -n "${GAMES_IMAGE:-}" ]; then
+      local GDEV="/dev/$VGROUP/$MACHINE-games"
+      if [ ! -e "$GDEV" ] && [ -e "/dev/mapper/${VGROUP}-${MACHINE}--games" ]; then
+        GDEV="/dev/mapper/${VGROUP}-${MACHINE}--games"
+      fi
+      if [ -e "$GDEV" ] || lvs "$VGROUP/$MACHINE-games" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+        local GLUN="${GAMES_LUN:-2}"
+        doit targetcli "/backstores/block create name=$MACHINE-games dev=$GDEV"
+        doit targetcli "/iscsi/$TARGET_IQN/tpg1/luns create /backstores/block/$MACHINE-games $GLUN"
+      else
+        echo "WARNING: Games snapshot $GDEV not found; skipping LUN 2 for $MACHINE." >&2
+      fi
     fi
 
     # Set up open demo mode for dynamic initiator connections with full write access
@@ -1558,22 +1578,41 @@ case "$COMMAND" in
     # Merge Games volume
     if ([ "$TARGET_VOL" = "games" ] || [ "$TARGET_VOL" = "all" ]) && [ -n "${GAMES_IMAGE:-}" ]; then
       bold "================ merge Games snapshot (thin delta) ================"
-      doit lvchange -ay -K "$VGROUP/$GAMES_IMAGE" 2>/dev/null || doit lvchange -ay "$VGROUP/$GAMES_IMAGE"
+      local G_ATTRS=""
+      if [ "$DRY_RUN" = no ]; then
+        G_ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$GAMES_IMAGE" 2>/dev/null | tr -d ' ' || true)
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${G_ATTRS:4:1}" != "a" ]]; then
+        doit lvchange -ay -K "$VGROUP/$GAMES_IMAGE" 2>/dev/null || doit lvchange -ay "$VGROUP/$GAMES_IMAGE" || true
+      fi
       if [ -e "/dev/$VGROUP/$GAMES_IMAGE" ] || [ "$DRY_RUN" = yes ]; then
-        doit blockdev --setrw "/dev/$VGROUP/$GAMES_IMAGE"
+        doit blockdev --setrw "/dev/$VGROUP/$GAMES_IMAGE" || true
       fi
 
-      thin-delta-sync "/dev/$VGROUP/$MERGE_HOST-games" "/dev/$VGROUP/$GAMES_IMAGE" "$THIN_POOL" "$VGROUP" || {
+      local SRC_GDEV="/dev/$VGROUP/$MERGE_HOST-games"
+      if [ ! -e "$SRC_GDEV" ] && [ -e "/dev/mapper/${VGROUP}-${MERGE_HOST}--games" ]; then
+        SRC_GDEV="/dev/mapper/${VGROUP}-${MERGE_HOST}--games"
+      fi
+
+      thin-delta-sync "$SRC_GDEV" "/dev/$VGROUP/$GAMES_IMAGE" "$THIN_POOL" "$VGROUP" || {
         echo "ERROR: Games delta merge failed or was interrupted. Snapshot preserved." >&2
         exit 1
       }
 
       bold "================ reset Games snapshot for $MERGE_HOST ================"
       if [ -e "/dev/$VGROUP/$MERGE_HOST-games" ] || lvs "$VGROUP/$MERGE_HOST-games" >/dev/null 2>&1; then
-        doit lvremove -f "/dev/$VGROUP/$MERGE_HOST-games"
+        doit lvremove -f "$VGROUP/$MERGE_HOST-games"
       fi
-      doit lvchange -p r "$VGROUP/$GAMES_IMAGE"
-      doit lvchange -an "$VGROUP/$GAMES_IMAGE"
+      local POST_ATTRS=""
+      if [ "$DRY_RUN" = no ]; then
+        POST_ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$GAMES_IMAGE" 2>/dev/null | tr -d ' ' || true)
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${POST_ATTRS:1:1}" != "r" ]]; then
+        doit lvchange -p r "$VGROUP/$GAMES_IMAGE" || true
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${POST_ATTRS:4:1}" == "a" ]]; then
+        doit lvchange -an "$VGROUP/$GAMES_IMAGE" || true
+      fi
       doit lvcreate -s -n "$MERGE_HOST-games" "$VGROUP/$GAMES_IMAGE" --thinpool "$VGROUP/$THIN_POOL"
     fi
 
