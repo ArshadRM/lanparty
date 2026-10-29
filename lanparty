@@ -310,6 +310,9 @@ delete-overlays() {
     if [ -e "/dev/$VGROUP/$MACHINE-cow" ] || lvs "$VGROUP/$MACHINE-cow" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
       doit lvremove -f "/dev/$VGROUP/$MACHINE-cow"
     fi
+    if [ -e "/dev/$VGROUP/$MACHINE-os" ] || lvs "$VGROUP/$MACHINE-os" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+      doit lvremove -f "/dev/$VGROUP/$MACHINE-os"
+    fi
     if [ -e "/dev/$VGROUP/$MACHINE-games" ] || lvs "$VGROUP/$MACHINE-games" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
       doit lvremove -f "/dev/$VGROUP/$MACHINE-games"
     fi
@@ -326,19 +329,38 @@ create-overlays() {
 
   bold "================ create overlays ================"
 
-  MASTER_SIZE=$(blockdev --getsz "/dev/$VGROUP/$BASE_IMAGE" 2>/dev/null || echo 524288000)
-
-  # Create the loopback layer -- for page caching -- over the master image, if it doesn't exist
-  # already.
-  if ! is-caching-enabled; then
-    unmount-master-locally
-    if losetup "$CACHE_LOOP_DEVICE" > /dev/null 2>&1; then
-      doit losetup -d "$CACHE_LOOP_DEVICE"
+  # If THIN_POOL is configured, prepare BASE_IMAGE as read-only and deactivated for external-origin thin snapshotting
+  if [ -n "${THIN_POOL:-}" ]; then
+    if lvs "$VGROUP/$BASE_IMAGE" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+      local ATTRS=""
+      if [ "$DRY_RUN" = no ]; then
+        ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$BASE_IMAGE" 2>/dev/null | tr -d ' ' || true)
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${ATTRS:1:1}" != "r" ]]; then
+        doit lvchange -p r "$VGROUP/$BASE_IMAGE" || true
+      fi
+      if [ "$DRY_RUN" = yes ] || [[ "${ATTRS:4:1}" == "a" ]]; then
+        doit lvchange -an "$VGROUP/$BASE_IMAGE" || true
+      fi
+    else
+      echo "ERROR: Configured BASE_IMAGE not found: $VGROUP/$BASE_IMAGE" >&2
+      exit 1
     fi
-    doit losetup --direct-io=off --read-only $CACHE_LOOP_DEVICE /dev/$VGROUP/$BASE_IMAGE
-    mount-master-locally
-  elif is-local-mount-point-configured && ! is-master-mounted-locally; then
-    mount-master-locally
+  else
+    MASTER_SIZE=$(blockdev --getsz "/dev/$VGROUP/$BASE_IMAGE" 2>/dev/null || echo 524288000)
+
+    # Create the loopback layer -- for page caching -- over the master image, if it doesn't exist
+    # already.
+    if ! is-caching-enabled; then
+      unmount-master-locally
+      if losetup "$CACHE_LOOP_DEVICE" > /dev/null 2>&1; then
+        doit losetup -d "$CACHE_LOOP_DEVICE"
+      fi
+      doit losetup --direct-io=off --read-only $CACHE_LOOP_DEVICE /dev/$VGROUP/$BASE_IMAGE
+      mount-master-locally
+    elif is-local-mount-point-configured && ! is-master-mounted-locally; then
+      mount-master-locally
+    fi
   fi
 
   # If GAMES_IMAGE is configured, ensure it is set to read-only and deactivated for external-origin thin snapshotting
@@ -363,14 +385,13 @@ create-overlays() {
   for MACHINE in "$@"; do
     # 1. OS Overlay
     if [ -n "${THIN_POOL:-}" ]; then
-      # Thin-provisioned COW volume inside THIN_POOL (quota default: 150G)
-      doit lvcreate -V "${OS_COW_QUOTA:-150G}" -T "$VGROUP/$THIN_POOL" -n "$MACHINE-cow"
+      doit lvcreate -s -n "$MACHINE-os" "$VGROUP/$BASE_IMAGE" --thinpool "$VGROUP/$THIN_POOL"
     else
       # Legacy thick extents
       EXTENTS=$(compute-extents $#)
       doit lvcreate -n "$MACHINE-cow" -l $EXTENTS $VGROUP ${OVERLAY_DEVICE:-}
+      doit dmsetup create cached-$MACHINE --table "0 $MASTER_SIZE snapshot $CACHE_LOOP_DEVICE /dev/$VGROUP/$MACHINE-cow N 128"
     fi
-    doit dmsetup create cached-$MACHINE --table "0 $MASTER_SIZE snapshot $CACHE_LOOP_DEVICE /dev/$VGROUP/$MACHINE-cow N 128"
 
     # 2. Games Thin Snapshot (if GAMES_IMAGE configured)
     if [ -n "${GAMES_IMAGE:-}" ]; then
@@ -679,7 +700,13 @@ start-iscsi() {
     local TARGET_IQN="$ISCSI_TARGET_PREFIX:$MACHINE"
 
     # 1. OS Backstore & LUN 1 (matches initiator DHCP configuration :::1:)
-    doit targetcli "/backstores/block create name=$MACHINE dev=/dev/mapper/cached-$MACHINE"
+    local OSDEV="/dev/$VGROUP/$MACHINE-os"
+    if [ ! -e "$OSDEV" ] && [ -e "/dev/mapper/${VGROUP}-${MACHINE}--os" ]; then
+      OSDEV="/dev/mapper/${VGROUP}-${MACHINE}--os"
+    elif [ ! -e "$OSDEV" ] && [ -e "/dev/mapper/cached-$MACHINE" ]; then
+      OSDEV="/dev/mapper/cached-$MACHINE"
+    fi
+    doit targetcli "/backstores/block create name=$MACHINE dev=$OSDEV"
     doit targetcli "/iscsi create $TARGET_IQN"
     doit targetcli "/iscsi/$TARGET_IQN/tpg1/portals create $SERVER_ADDR 3260"
     doit targetcli "/iscsi/$TARGET_IQN/tpg1/luns create /backstores/block/$MACHINE 1"
@@ -786,7 +813,10 @@ show-status() {
     local OS_STAT="offline"
     local GAMES_STAT=""
 
-    if [ -e "/dev/mapper/cached-$MACHINE" ]; then
+    if [ -e "/dev/$VGROUP/$MACHINE-os" ] || lvs "$VGROUP/$MACHINE-os" >/dev/null 2>&1; then
+      OS_PCT=$(lvs --noheadings -o data_percent "$VGROUP/$MACHINE-os" 2>/dev/null | tr -d ' ' || true)
+      OS_STAT="${OS_PCT:-0.00}%"
+    elif [ -e "/dev/mapper/cached-$MACHINE" ]; then
       STATUS=$(dmsetup status "cached-$MACHINE" 2>/dev/null | cut -d' ' -f 4 || true)
       if [ "$STATUS" = Invalid ]; then
         OS_STAT="exhausted"
@@ -1454,6 +1484,16 @@ case "$COMMAND" in
     stop-iscsi "${HOSTNAMES[@]}"
     delete-overlays "${HOSTNAMES[@]}"
 
+    # If no OS snapshots remain in the VG, restore BASE_IMAGE to active read-write
+    if [ -n "${THIN_POOL:-}" ]; then
+      if lvs "$VGROUP/$BASE_IMAGE" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+        if [ "$DRY_RUN" = yes ] || ! lvs --noheadings -o origin "$VGROUP" 2>/dev/null | grep -qw "$BASE_IMAGE"; then
+          doit lvchange -p rw "$VGROUP/$BASE_IMAGE" || true
+          doit lvchange -ay "$VGROUP/$BASE_IMAGE" || true
+        fi
+      fi
+    fi
+
     # If no games snapshots remain in the VG, restore GAMES_IMAGE to active read-write
     if [ -n "${GAMES_IMAGE:-}" ]; then
       if lvs "$VGROUP/$GAMES_IMAGE" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
@@ -1511,16 +1551,19 @@ case "$COMMAND" in
 
     # Validate prerequisites depending on target
     if [ "$TARGET_VOL" = "os" ] || [ "$TARGET_VOL" = "all" ]; then
-      if [ ! -e "/dev/mapper/cached-$MERGE_HOST" ] && [ "$DRY_RUN" = no ]; then
-        echo "ERROR: No active OS overlay found at /dev/mapper/cached-$MERGE_HOST." >&2
-        exit 1
-      fi
-      if [ "$DRY_RUN" = no ]; then
-        STATUS=$(dmsetup status "cached-$MERGE_HOST" 2>/dev/null | cut -d' ' -f 4 || true)
-        if [ "$STATUS" = "Invalid" ]; then
-          echo "ERROR: OS overlay for $MERGE_HOST is exhausted and invalid. Cannot merge." >&2
-          exit 1
+      if [ -e "/dev/$VGROUP/$MERGE_HOST-os" ] || lvs "$VGROUP/$MERGE_HOST-os" >/dev/null 2>&1; then
+        : # Valid thin snapshot
+      elif [ -e "/dev/mapper/cached-$MERGE_HOST" ]; then
+        if [ "$DRY_RUN" = no ]; then
+          STATUS=$(dmsetup status "cached-$MERGE_HOST" 2>/dev/null | cut -d' ' -f 4 || true)
+          if [ "$STATUS" = "Invalid" ]; then
+            echo "ERROR: OS overlay for $MERGE_HOST is exhausted and invalid. Cannot merge." >&2
+            exit 1
+          fi
         fi
+      elif [ "$DRY_RUN" = no ]; then
+        echo "ERROR: No active OS overlay found for $MERGE_HOST." >&2
+        exit 1
       fi
     fi
 
@@ -1545,50 +1588,87 @@ case "$COMMAND" in
 
     # Merge OS volume
     if [ "$TARGET_VOL" = "os" ] || [ "$TARGET_VOL" = "all" ]; then
-      bold "================ merge OS overlay (smart diff) ================"
-      unmount-master-locally
-      diff-sync-devices "/dev/mapper/cached-$MERGE_HOST" "/dev/$VGROUP/$BASE_IMAGE" 2 || {
-        echo "ERROR: OS diff merge failed or was interrupted. Overlays preserved." >&2
-        exit 1
-      }
+      if [ -n "${THIN_POOL:-}" ] && ([ -e "/dev/$VGROUP/$MERGE_HOST-os" ] || lvs "$VGROUP/$MERGE_HOST-os" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]); then
+        bold "================ merge OS snapshot (thin delta) ================"
+        OS_ATTRS=""
+        if [ "$DRY_RUN" = no ]; then
+          OS_ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$BASE_IMAGE" 2>/dev/null | tr -d ' ' || true)
+        fi
+        if [ "$DRY_RUN" = yes ] || [[ "${OS_ATTRS:4:1}" != "a" ]]; then
+          doit lvchange -ay -K "$VGROUP/$BASE_IMAGE" 2>/dev/null || doit lvchange -ay "$VGROUP/$BASE_IMAGE" || true
+        fi
+        if [ -e "/dev/$VGROUP/$BASE_IMAGE" ] || [ "$DRY_RUN" = yes ]; then
+          doit blockdev --setrw "/dev/$VGROUP/$BASE_IMAGE" || true
+        fi
 
-      bold "================ reset OS overlay for $MERGE_HOST ================"
-      if [ -e "/dev/mapper/cached-$MERGE_HOST" ]; then
-        doit dmsetup remove "/dev/mapper/cached-$MERGE_HOST"
-      fi
-      if [ -e "/dev/$VGROUP/$MERGE_HOST-cow" ]; then
-        doit lvremove -f "/dev/$VGROUP/$MERGE_HOST-cow"
-      fi
+        SRC_OSDEV="/dev/$VGROUP/$MERGE_HOST-os"
+        if [ ! -e "$SRC_OSDEV" ] && [ -e "/dev/mapper/${VGROUP}-${MERGE_HOST}--os" ]; then
+          SRC_OSDEV="/dev/mapper/${VGROUP}-${MERGE_HOST}--os"
+        fi
 
-      if is-caching-enabled; then
-        doit losetup -d "$CACHE_LOOP_DEVICE"
-      fi
-      mount-master-locally
+        thin-delta-sync "$SRC_OSDEV" "/dev/$VGROUP/$BASE_IMAGE" "$THIN_POOL" "$VGROUP" || {
+          echo "ERROR: OS delta merge failed or was interrupted. Snapshot preserved." >&2
+          exit 1
+        }
 
-      # Recreate fresh OS overlay
-      MASTER_SIZE=$(blockdev --getsz "/dev/$VGROUP/$BASE_IMAGE" 2>/dev/null || echo 524288000)
-      if ! is-caching-enabled; then
+        bold "================ reset OS snapshot for $MERGE_HOST ================"
+        if [ -e "/dev/$VGROUP/$MERGE_HOST-os" ] || lvs "$VGROUP/$MERGE_HOST-os" >/dev/null 2>&1; then
+          doit lvremove -f "$VGROUP/$MERGE_HOST-os"
+        fi
+        POST_OS_ATTRS=""
+        if [ "$DRY_RUN" = no ]; then
+          POST_OS_ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$BASE_IMAGE" 2>/dev/null | tr -d ' ' || true)
+        fi
+        if [ "$DRY_RUN" = yes ] || [[ "${POST_OS_ATTRS:1:1}" != "r" ]]; then
+          doit lvchange -p r "$VGROUP/$BASE_IMAGE" || true
+        fi
+        if [ "$DRY_RUN" = yes ] || [[ "${POST_OS_ATTRS:4:1}" == "a" ]]; then
+          doit lvchange -an "$VGROUP/$BASE_IMAGE" || true
+        fi
+        doit lvcreate -s -n "$MERGE_HOST-os" "$VGROUP/$BASE_IMAGE" --thinpool "$VGROUP/$THIN_POOL"
+      else
+        # Legacy dm-snapshot diff merge fallback
+        bold "================ merge OS overlay (smart diff) ================"
         unmount-master-locally
-        if losetup "$CACHE_LOOP_DEVICE" > /dev/null 2>&1; then
+        diff-sync-devices "/dev/mapper/cached-$MERGE_HOST" "/dev/$VGROUP/$BASE_IMAGE" 2 || {
+          echo "ERROR: OS diff merge failed or was interrupted. Overlays preserved." >&2
+          exit 1
+        }
+
+        bold "================ reset OS overlay for $MERGE_HOST ================"
+        if [ -e "/dev/mapper/cached-$MERGE_HOST" ]; then
+          doit dmsetup remove "/dev/mapper/cached-$MERGE_HOST"
+        fi
+        if [ -e "/dev/$VGROUP/$MERGE_HOST-cow" ]; then
+          doit lvremove -f "/dev/$VGROUP/$MERGE_HOST-cow"
+        fi
+
+        if is-caching-enabled; then
           doit losetup -d "$CACHE_LOOP_DEVICE"
         fi
-        doit losetup --direct-io=off --read-only "$CACHE_LOOP_DEVICE" "/dev/$VGROUP/$BASE_IMAGE"
         mount-master-locally
-      fi
 
-      if [ -n "${THIN_POOL:-}" ]; then
-        doit lvcreate -V "${OS_COW_QUOTA:-150G}" -T "$VGROUP/$THIN_POOL" -n "$MERGE_HOST-cow"
-      else
+        # Recreate fresh OS overlay
+        MASTER_SIZE=$(blockdev --getsz "/dev/$VGROUP/$BASE_IMAGE" 2>/dev/null || echo 524288000)
+        if ! is-caching-enabled; then
+          unmount-master-locally
+          if losetup "$CACHE_LOOP_DEVICE" > /dev/null 2>&1; then
+            doit losetup -d "$CACHE_LOOP_DEVICE"
+          fi
+          doit losetup --direct-io=off --read-only "$CACHE_LOOP_DEVICE" "/dev/$VGROUP/$BASE_IMAGE"
+          mount-master-locally
+        fi
+
         EXTENTS=$(compute-extents 1)
         doit lvcreate -n "$MERGE_HOST-cow" -l $EXTENTS $VGROUP ${OVERLAY_DEVICE:-}
+        doit dmsetup create "cached-$MERGE_HOST" --table "0 $MASTER_SIZE snapshot $CACHE_LOOP_DEVICE /dev/$VGROUP/$MERGE_HOST-cow N 128"
       fi
-      doit dmsetup create "cached-$MERGE_HOST" --table "0 $MASTER_SIZE snapshot $CACHE_LOOP_DEVICE /dev/$VGROUP/$MERGE_HOST-cow N 128"
     fi
 
     # Merge Games volume
     if ([ "$TARGET_VOL" = "games" ] || [ "$TARGET_VOL" = "all" ]) && [ -n "${GAMES_IMAGE:-}" ]; then
       bold "================ merge Games snapshot (thin delta) ================"
-      local G_ATTRS=""
+      G_ATTRS=""
       if [ "$DRY_RUN" = no ]; then
         G_ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$GAMES_IMAGE" 2>/dev/null | tr -d ' ' || true)
       fi
@@ -1599,7 +1679,7 @@ case "$COMMAND" in
         doit blockdev --setrw "/dev/$VGROUP/$GAMES_IMAGE" || true
       fi
 
-      local SRC_GDEV="/dev/$VGROUP/$MERGE_HOST-games"
+      SRC_GDEV="/dev/$VGROUP/$MERGE_HOST-games"
       if [ ! -e "$SRC_GDEV" ] && [ -e "/dev/mapper/${VGROUP}-${MERGE_HOST}--games" ]; then
         SRC_GDEV="/dev/mapper/${VGROUP}-${MERGE_HOST}--games"
       fi
@@ -1613,7 +1693,7 @@ case "$COMMAND" in
       if [ -e "/dev/$VGROUP/$MERGE_HOST-games" ] || lvs "$VGROUP/$MERGE_HOST-games" >/dev/null 2>&1; then
         doit lvremove -f "$VGROUP/$MERGE_HOST-games"
       fi
-      local POST_ATTRS=""
+      POST_ATTRS=""
       if [ "$DRY_RUN" = no ]; then
         POST_ATTRS=$(lvs --noheadings -o lv_attr "$VGROUP/$GAMES_IMAGE" 2>/dev/null | tr -d ' ' || true)
       fi

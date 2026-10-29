@@ -10,18 +10,22 @@ The system provides high-performance, diskless netbooting for LAN party client n
 
 ### Storage Layout:
 - **Base OS Image (`BASE_IMAGE="main"`)**:
-  - Located on a fast SAS SSD (250GB).
-  - Loopback cached via `/dev/loop7` (`CACHE_LOOP_DEVICE`) with page caching enabled.
-  - Client COW overlays are thin-provisioned LVs inside `scratchpool` (default virtual quota: `OS_COW_QUOTA=150G`).
-  - Device mapper target: `0 <sectors> snapshot /dev/loop7 /dev/$VGROUP/$MACHINE-cow N 128`.
+  - Located on a fast SAS SSD (250GB, `vg1/main`).
+  - **Thin Provisioned Mode (when `THIN_POOL` is set)**:
+    - Client overlays are **external-origin thin snapshots** inside `scratchpool`: `lvcreate -s -n "$MACHINE-os" "$VGROUP/$BASE_IMAGE" --thinpool "$VGROUP/$THIN_POOL"`.
+    - Eliminates loopback device caching and `dm-snapshot` tables entirely.
+    - Base image is secured as read-only (`-p r`) and deactivated (`-an`).
+  - **Legacy Mode (when `THIN_POOL` is unset)**:
+    - Loopback cached via `/dev/loop7` (`CACHE_LOOP_DEVICE`) with page caching enabled.
+    - Client COW overlays are standard LVs (`$MACHINE-cow`) with `dmsetup create cached-$MACHINE --table "0 <sectors> snapshot /dev/loop7 /dev/$VGROUP/$MACHINE-cow N 128"`.
   - Exposed via iSCSI as **LUN 1** (matching initiator DHCP `root-path` `:::1:`).
 - **Base Games Image (`GAMES_IMAGE="master"`)**:
   - Located on a 4TB RAID 0 HDD array (`vg1/master`).
-  - Client COW overlays are **external-origin thin snapshots** inside `scratchpool` (default quota: `GAMES_SNAPSHOT_QUOTA=350G`).
+  - Client COW overlays are **external-origin thin snapshots** inside `scratchpool`: `lvcreate -s -n "$MACHINE-games" "$VGROUP/$GAMES_IMAGE" --thinpool "$VGROUP/$THIN_POOL"` (default quota: `GAMES_SNAPSHOT_QUOTA=350G`).
   - Exposed via iSCSI as **LUN 2** (`GAMES_LUN=2`).
 - **Scratch Pool (`THIN_POOL="scratchpool"`)**:
   - LVM Thin Pool residing on a dedicated NVMe scratch SSD (`700GB`).
-  - Hosts both the OS thin COW overlays (`$MACHINE-cow`) and the games thin snapshots (`$MACHINE-games`).
+  - Hosts both the OS thin snapshots (`$MACHINE-os`) and the games thin snapshots (`$MACHINE-games`).
 - **Optional Games Mode**:
   - If `GAMES_IMAGE=""` or is commented out in `/etc/lanparty.conf`, the system transparently runs in single-drive OS-only mode (skipping all games logic and LUN 2 exports).
 
@@ -64,10 +68,16 @@ lanparty merge <HOST> [os | games | all]
 ```
 *(Default when volume parameter is omitted: `all`)*
 
-### OS Merge (Smart Block Diff):
-- Base image is unmounted locally.
-- Python-based diff scanner (`diff-sync-devices`) reads chunks from the client snapshot (`/dev/mapper/cached-$HOST`) and destination base (`/dev/$VGROUP/$BASE_IMAGE`), comparing blocks in memory and only writing modified blocks.
-- Cleans up and recreates a fresh `$HOST-cow` overlay.
+### OS Merge:
+- **Thin Mode (when `THIN_POOL` is set)**:
+  - Uses `thin-delta-sync` to parse metadata from the thin pool via `thin_dump -m`.
+  - Only copies blocks modified by the client node directly into `$BASE_IMAGE` in seconds.
+  - Temporarily activates and unlocks destination base storage with `blockdev --setrw /dev/$VGROUP/$BASE_IMAGE`.
+  - Re-secures `BASE_IMAGE` (`lvchange -p r && lvchange -an`), removes the merged snapshot, and creates a fresh empty `$MACHINE-os` snapshot.
+- **Legacy Fallback (when `THIN_POOL` is unset)**:
+  - Base image is unmounted locally.
+  - Python-based diff scanner (`diff-sync-devices`) reads chunks from the client snapshot (`/dev/mapper/cached-$HOST`) and destination base (`/dev/$VGROUP/$BASE_IMAGE`), comparing blocks in memory and writing modified blocks.
+  - Cleans up and recreates a fresh `$HOST-cow` overlay with `dmsetup`.
 
 ### Games Merge (Fast Thin-Delta):
 - `thin-delta-sync` extracts block mappings from the thin pool metadata using `thin_dump -m` on the metadata LV (`${VG}-${POOL}_tmeta`).
