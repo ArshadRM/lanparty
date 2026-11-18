@@ -409,6 +409,39 @@ create-overlays() {
   fi
 }
 
+enable-volume-writes() {
+  # Unlock write access to an active logical volume (which may be an external origin)
+  # by clearing blockdev read-only and reloading its device-mapper table in read-write mode.
+  local VOL="$1"
+  local DEV="/dev/$VGROUP/$VOL"
+
+  # 1. Attempt LVM permission change if allowed
+  doit lvchange -p rw "$VGROUP/$VOL" 2>/dev/null || true
+
+  # 2. Clear generic block device read-only flag
+  if [ -e "$DEV" ] || [ "$DRY_RUN" = yes ]; then
+    doit blockdev --setrw "$DEV" || true
+  fi
+
+  # 3. Reload device-mapper table in read-write mode
+  local DM_NAME="${VGROUP}-${VOL}"
+  DM_NAME=$(echo "$DM_NAME" | sed 's/-/--/g')
+  if dmsetup info "$DM_NAME" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+    if [ "$DRY_RUN" = no ]; then
+      local TABLE
+      TABLE=$(dmsetup table --showkeys "$DM_NAME" 2>/dev/null || true)
+      if [ -n "$TABLE" ]; then
+        # dmsetup reload without --readonly loads the table in read-write mode
+        dmsetup reload "$DM_NAME" --table "$TABLE" 2>/dev/null || true
+        dmsetup resume "$DM_NAME" 2>/dev/null || true
+      fi
+    else
+      echo-command "dmsetup reload $DM_NAME --table \"\$(dmsetup table --showkeys $DM_NAME)\""
+      echo-command "dmsetup resume $DM_NAME"
+    fi
+  fi
+}
+
 diff-sync-devices() {
   # Perform a block-level diff merge from $1 (source overlay) into $2 (destination base image).
   # Compares blocks in memory and only writes modified blocks to disk, skipping unchanged blocks.
@@ -553,31 +586,52 @@ thin-delta-sync() {
     META_DEV="/dev/$VG/${POOL}_tmeta"
   fi
 
+  local POOL_DEV="/dev/mapper/${VG}-${POOL}-tpool"
+  if [ ! -e "$POOL_DEV" ]; then
+    POOL_DEV="/dev/mapper/${VG}-${POOL}"
+  fi
+
   local XML_FILE
   XML_FILE=$(mktemp /tmp/thin_dump_XXXXXX.xml)
+  local DUMP_LOG
+  DUMP_LOG=$(mktemp /tmp/thin_dump_log_XXXXXX.txt)
 
-  # Attempt metadata dump using thin_dump -m (live metadata snapshot)
-  if ! thin_dump -m --dev-id "$THIN_ID" "$META_DEV" > "$XML_FILE" 2>/dev/null; then
-    # Fallback to reserve_metadata_snap message if needed
-    dmsetup message "/dev/mapper/${VG}-${POOL}-tpool" 0 reserve_metadata_snap 2>/dev/null || true
-    thin_dump --dev-id "$THIN_ID" "$META_DEV" > "$XML_FILE" 2>/dev/null || true
-    dmsetup message "/dev/mapper/${VG}-${POOL}-tpool" 0 release_metadata_snap 2>/dev/null || true
+  # Step 1: Reserve metadata snapshot on the live pool
+  dmsetup message "$POOL_DEV" 0 reserve_metadata_snap >/dev/null 2>&1 || true
+
+  # Step 2: Attempt metadata dump using thin_dump -m with --dev-id
+  if ! thin_dump -m --dev-id "$THIN_ID" "$META_DEV" > "$XML_FILE" 2>"$DUMP_LOG"; then
+    # Step 3: Fall back to thin_dump -m without --dev-id (older tools; Python filters dev_id)
+    thin_dump -m "$META_DEV" > "$XML_FILE" 2>"$DUMP_LOG" || true
+  fi
+
+  # Step 4: Always release metadata snapshot
+  dmsetup message "$POOL_DEV" 0 release_metadata_snap >/dev/null 2>&1 || true
+
+  # Step 5: Fallback if -m is not supported or failed
+  if [ ! -s "$XML_FILE" ]; then
+    thin_dump --dev-id "$THIN_ID" "$META_DEV" > "$XML_FILE" 2>"$DUMP_LOG" || \
+    thin_dump "$META_DEV" > "$XML_FILE" 2>"$DUMP_LOG" || true
   fi
 
   if [ ! -s "$XML_FILE" ]; then
-    echo "WARNING: thin_dump could not extract mappings for thin ID $THIN_ID; falling back to smart diff scan..."
-    rm -f "$XML_FILE"
+    local ERR_MSG
+    ERR_MSG=$(cat "$DUMP_LOG" 2>/dev/null | tr '\n' ' ' | head -c 200 || echo "unknown error")
+    echo "WARNING: thin_dump could not extract mappings for thin ID $THIN_ID (${ERR_MSG}); falling back to smart diff scan..."
+    rm -f "$XML_FILE" "$DUMP_LOG"
     diff-sync-devices "$SRC" "$DST" 4
     return $?
   fi
+  rm -f "$DUMP_LOG"
 
-  python3 - "$SRC" "$DST" "$XML_FILE" << 'EOF'
+  python3 - "$SRC" "$DST" "$XML_FILE" "$THIN_ID" << 'EOF'
 import sys, os, time
 import xml.etree.ElementTree as ET
 
 src_path = sys.argv[1]
 dst_path = sys.argv[2]
 xml_path = sys.argv[3]
+target_thin_id = sys.argv[4] if len(sys.argv) > 4 else None
 
 try:
     tree = ET.parse(xml_path)
@@ -592,6 +646,9 @@ chunk_size = data_block_sectors * 512
 
 ranges = []
 for dev in root.findall("device"):
+    dev_id = dev.attrib.get("dev_id")
+    if target_thin_id and dev_id != str(target_thin_id):
+        continue
     for mapping in dev:
         if mapping.tag == "range_mapping":
             origin_begin = int(mapping.attrib["origin_begin"])
@@ -1597,9 +1654,7 @@ case "$COMMAND" in
         if [ "$DRY_RUN" = yes ] || [[ "${OS_ATTRS:4:1}" != "a" ]]; then
           doit lvchange -ay -K "$VGROUP/$BASE_IMAGE" 2>/dev/null || doit lvchange -ay "$VGROUP/$BASE_IMAGE" || true
         fi
-        if [ -e "/dev/$VGROUP/$BASE_IMAGE" ] || [ "$DRY_RUN" = yes ]; then
-          doit blockdev --setrw "/dev/$VGROUP/$BASE_IMAGE" || true
-        fi
+        enable-volume-writes "$BASE_IMAGE"
 
         SRC_OSDEV="/dev/$VGROUP/$MERGE_HOST-os"
         if [ ! -e "$SRC_OSDEV" ] && [ -e "/dev/mapper/${VGROUP}-${MERGE_HOST}--os" ]; then
@@ -1630,6 +1685,7 @@ case "$COMMAND" in
         # Legacy dm-snapshot diff merge fallback
         bold "================ merge OS overlay (smart diff) ================"
         unmount-master-locally
+        enable-volume-writes "$BASE_IMAGE"
         diff-sync-devices "/dev/mapper/cached-$MERGE_HOST" "/dev/$VGROUP/$BASE_IMAGE" 2 || {
           echo "ERROR: OS diff merge failed or was interrupted. Overlays preserved." >&2
           exit 1
@@ -1675,9 +1731,7 @@ case "$COMMAND" in
       if [ "$DRY_RUN" = yes ] || [[ "${G_ATTRS:4:1}" != "a" ]]; then
         doit lvchange -ay -K "$VGROUP/$GAMES_IMAGE" 2>/dev/null || doit lvchange -ay "$VGROUP/$GAMES_IMAGE" || true
       fi
-      if [ -e "/dev/$VGROUP/$GAMES_IMAGE" ] || [ "$DRY_RUN" = yes ]; then
-        doit blockdev --setrw "/dev/$VGROUP/$GAMES_IMAGE" || true
-      fi
+      enable-volume-writes "$GAMES_IMAGE"
 
       SRC_GDEV="/dev/$VGROUP/$MERGE_HOST-games"
       if [ ! -e "$SRC_GDEV" ] && [ -e "/dev/mapper/${VGROUP}-${MERGE_HOST}--games" ]; then
