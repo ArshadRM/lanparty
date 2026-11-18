@@ -220,7 +220,7 @@ fi
 > When an LVM volume is configured with read-only permission (`lvchange -p r`), LVM activates it in kernel device-mapper with the `DM_READONLY_FLAG` ioctl.
 > Running `blockdev --setrw` only toggles the generic block layer flag (`bdev->bd_disk->ro`), but the device-mapper driver itself continues to enforce read-only table mode. Any attempt to write blocks (`write()`) triggers `PermissionError: [Errno 1] Operation not permitted` (-EPERM).
 > **The Fix (`enable-volume-writes`)**:
-> During merge operations, `lanparty` queries the device-mapper table and reloads it in read-write mode via `dmsetup reload <DM_NAME> --table "$TABLE"` followed by `dmsetup resume <DM_NAME>`. This allows delta blocks to stream directly into the base volume without altering LVM metadata.
+> During merge operations, `lanparty` queries the active device-mapper name for the volume (`dmsetup info -c --noheadings -o name "$DEV"`), extracts the table (`dmsetup table --showkeys "$DM_NAME"`), and reloads it in read-write mode via `dmsetup reload "$DM_NAME" --table "$TABLE"` followed by `dmsetup resume "$DM_NAME"`. This allows delta blocks to stream directly into the base volume without altering LVM metadata. Note: Never use manual hyphen string manipulation on device names, as device-mapper names can differ from simple VG-LV concatenation.
 
 ### E. Live `thin_dump -m` & Metadata Snapshot Reservation
 > [!TIP]

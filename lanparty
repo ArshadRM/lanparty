@@ -424,20 +424,25 @@ enable-volume-writes() {
   fi
 
   # 3. Reload device-mapper table in read-write mode
-  local DM_NAME="${VGROUP}-${VOL}"
-  DM_NAME=$(echo "$DM_NAME" | sed 's/-/--/g')
+  local DM_NAME=""
+  if [ -e "$DEV" ]; then
+    DM_NAME=$(dmsetup info -c --noheadings -o name "$DEV" 2>/dev/null | tr -d ' ' || true)
+  fi
+  if [ -z "$DM_NAME" ]; then
+    DM_NAME="${VGROUP}-${VOL}"
+  fi
+
   if dmsetup info "$DM_NAME" >/dev/null 2>&1 || [ "$DRY_RUN" = yes ]; then
+    local TABLE=""
     if [ "$DRY_RUN" = no ]; then
-      local TABLE
       TABLE=$(dmsetup table --showkeys "$DM_NAME" 2>/dev/null || true)
-      if [ -n "$TABLE" ]; then
-        # dmsetup reload without --readonly loads the table in read-write mode
-        dmsetup reload "$DM_NAME" --table "$TABLE" 2>/dev/null || true
-        dmsetup resume "$DM_NAME" 2>/dev/null || true
-      fi
     else
-      echo-command "dmsetup reload $DM_NAME --table \"\$(dmsetup table --showkeys $DM_NAME)\""
-      echo-command "dmsetup resume $DM_NAME"
+      TABLE="0 524288000 linear /dev/sda1 0"
+    fi
+    if [ -n "$TABLE" ]; then
+      # dmsetup reload without --readonly loads the table in read-write mode
+      doit dmsetup reload "$DM_NAME" --table "$TABLE"
+      doit dmsetup resume "$DM_NAME"
     fi
   fi
 }
